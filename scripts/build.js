@@ -514,6 +514,8 @@ log(`субтитров: ${CAPTIONS.length} групп`);
 // 5. монтажный лист (+ зум-ритм beatZoom)
 // приоритет: флаг --beat → из scenario-файла → выкл по умолчанию
 let blocks, beatZoom = false, beatSec = buildOptions.beatSec, stillWindows = [];
+let scenarioAudio = null;
+let scenarioTheme = null;
 let activeScenarioPath = null;
 if (scenarioFile) {
   activeScenarioPath = buildContext.resolveBrief(scenarioFile);
@@ -524,6 +526,10 @@ if (scenarioFile) {
     beatSec = finiteNumber(sc.beatSec, 'scenario beatSec', { min: 0.1, max: 60 });
   }
   if (sc.stillWindows != null) stillWindows = sc.stillWindows;
+  // audio.music из листа: без этого фоновая музыка молча терялась до рендера
+  if (sc.audio != null) scenarioAudio = sc.audio;
+  // тема из листа: раньше читался только флаг --theme, поле theme молча терялось
+  if (sc.theme != null) scenarioTheme = sc.theme;
   log(`лист из файла: ${blocks.length} блоков`);
 } else {
   blocks = draftScenario(CAPTIONS);
@@ -567,6 +573,10 @@ if (args.includes('--autopos')) {
 
 // 5c. (опц.) внешний бренд-пак – тема из THEMES_EXT/<id>/theme.json (приватный стиль)
 let themeVal = resolveTheme(theme);
+// флаг --theme важнее листа; без флага берём тему из листа
+if (scenarioTheme != null && !args.includes('--theme')) {
+  themeVal = typeof scenarioTheme === 'string' ? resolveTheme(scenarioTheme) : scenarioTheme;
+}
 
 // 5d. (опц.) autotheme – тема из палитры видео (Фаза 4.4-4.6)
 if (args.includes('--autotheme')) {
@@ -585,6 +595,7 @@ if (args.includes('--autotheme')) {
 
 // 7. props
 const props = { source: 'source.mp4', theme: themeVal, blocks, width: W, height: H, fps: FPS, durationInFrames: durF, beatZoom, beatSec, stillWindows };
+if (scenarioAudio) props.audio = scenarioAudio;
 
 // 7b. валидация листа ДО рендера (Фаза 2.1)
 const { validate } = require('./validate');
