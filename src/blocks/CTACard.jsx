@@ -21,7 +21,7 @@ export const CTACard = ({ head = 'ЖМИ НА КНОПКУ', btn = 'ССЫЛКА
 
   return (
     <div style={{
-      ...centerPos(pos, { bottomGap: 150 }),
+      ...centerPos(pos, { bottomGap: 150, sideWidth: t.textWidth ? Math.round(width * t.textWidth) : null }),
       transform: `translateY(${y}px) scale(${us})`, opacity: s,
     }}>
       <div style={{

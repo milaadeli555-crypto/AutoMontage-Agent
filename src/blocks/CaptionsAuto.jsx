@@ -17,6 +17,12 @@ export const CaptionsAuto = ({ groups = [], offset = 520, tail = 0.15, pos = 'bo
 
   // локальный кадр от начала группы — для входной анимации плашки
   const localFrame = frame - Math.round(g.start * fps);
+  // plain: субтитры без тёмной подложки — слова прямо на кадре.
+  const plain = !!t.plain;
+  const flatShadow = t.textShadow || '0 3px 16px rgba(0,0,0,.8)';
+  const idleColor = t.captionIdleColor || t.colors.milk;
+  const activeColor = t.captionActiveColor || t.colors.accent;
+  const activeScale = t.captionActiveScale || 1;
   const s = springIn(localFrame, fps, 0, { damping: 12, mass: 0.5 });
   const scale = clamp(s, 0, 1, 0.85, 1);
 
@@ -28,22 +34,33 @@ export const CaptionsAuto = ({ groups = [], offset = 520, tail = 0.15, pos = 'bo
     }}>
       <div style={{
         display: 'inline-block',
-        background: t.motion.glow ? 'rgba(14,14,12,.82)' : 'rgba(61,46,36,.9)',
-        border: t.cardBorder, borderRadius: 18, padding: '16px 26px',
-        boxShadow: t.cardShadow, maxWidth: 640,
+        background: plain
+          ? 'transparent'
+          : (t.motion.glow ? 'rgba(14,14,12,.82)' : 'rgba(61,46,36,.9)'),
+        border: plain ? 'none' : t.cardBorder,
+        borderRadius: plain ? 0 : 18,
+        padding: plain ? 0 : '16px 26px',
+        boxShadow: plain ? 'none' : t.cardShadow,
+        maxWidth: 640,
         fontFamily: t.fonts.display, fontWeight: 700, textTransform: 'uppercase',
-        fontSize: 46, lineHeight: 1.06, letterSpacing: 0.5,
+        fontSize: t.captionSize || 46,
+        lineHeight: t.captionLineHeight || 1.06, letterSpacing: 0.5,
       }}>
         {g.words.map((w, i) => {
           const active = time >= w.s && time <= w.e + tail;
           return (
             <span key={i} style={{
-              color: active ? t.colors.accent : t.colors.milk,
-              textShadow: active ? glowText(t, t.colors.accent) : 'none',
+              color: active ? activeColor : idleColor,
+              textShadow: plain
+                ? flatShadow
+                : (active ? glowText(t, t.colors.accent) : 'none'),
               transition: 'none',
               marginRight: 10,
               display: 'inline-block',
-              transform: active ? 'translateY(-2px)' : 'none',
+              transformOrigin: 'center bottom',
+              transform: active
+                ? `translateY(-4px) scale(${activeScale})`
+                : 'none',
             }}>{w.w}</span>
           );
         })}

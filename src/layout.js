@@ -46,11 +46,13 @@ export function originFor(pos) {
 }
 
 // Стиль для ЦЕНТРИРОВАННОГО блока (SubtitleCard/CTACard) — двигаем по горизонтали/вертикали.
-export function centerPos(pos, { topGap = 200, bottomGap = 210 } = {}) {
+export function centerPos(pos, { topGap = 200, bottomGap = 210, sideWidth = null } = {}) {
   const p = normPos(pos, { h: 'center', v: 'bottom' });
   // Для боковых плашек ширина УЖЕ (боковая колонка ~28% кадра), чтобы длинный
   // текст переносился на строки в колонке, а не тянулся в центр на лицо.
-  const sideW = 480;
+  // 480 рассчитаны на горизонт 1920; на вертикали 1080 это почти половина кадра,
+  // поэтому ширину можно задать явно (тема: textWidth как доля ширины кадра).
+  const sideW = sideWidth || 480;
   const s = { position: 'absolute', width: p.h === 'center' ? 720 : sideW, textAlign: 'center' };
   if (p.h === 'left') { s.left = 0; s.textAlign = 'left'; s.paddingLeft = MARGIN; }
   else if (p.h === 'right') { s.right = 0; s.textAlign = 'right'; s.paddingRight = MARGIN; }

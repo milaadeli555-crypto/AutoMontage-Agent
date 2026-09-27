@@ -17,7 +17,7 @@ export const SubtitleCard = ({ text = 'РЕПЛИКА', accent = false, sub = nu
 
   return (
     <div style={{
-      ...centerPos(pos, { bottomGap: 210 }),
+      ...centerPos(pos, { bottomGap: 210, sideWidth: t.textWidth ? Math.round(width * t.textWidth) : null }),
       transform: `scale(${scale})`, opacity: s,
     }}>
       <div style={{
