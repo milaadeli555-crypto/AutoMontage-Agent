@@ -109,7 +109,7 @@ flowchart LR
   A --> M["Опциональный source-edit или takes-edit"]
   B --> M
   T["Дубли: input/takes + transcript/takes"] --> M
-  M --> N["Versioned master + remapped transcript"]
+  M --> N["1080p working master + remapped transcript"]
   N --> C["Словарь + LLM-проруф"]
   B --> C
   C --> D["Markdown + JSON status=draft"]
@@ -154,12 +154,70 @@ Brief замораживает исходник, тему, аспект, раз�
 
 Сокращение исходника - отдельная data-boundary до draft. `scripts/project/build-master.js`
 валидирует `edit/vNN-source.json` относительно активной source revision и FPS, собирает диапазоны
-через существующий trim pipeline, полностью декодирует результат и атомарно публикует новую пару
+через существующий trim pipeline: `scripts/working-quality.js` выбирает размер от
+отображаемого кадра (с учётом поворота), а `scale=W:H:flags=lanczos,setsar=1` после concat
+уменьшает короткую сторону до 1080 внутри того же кодирования. `--quality source` сохраняет
+родной размер; маленькие кадры не увеличиваются, нечётные стороны округляются вниз.
+Master полностью декодирует результат и атомарно публикует новую пару
 `input/source-vNN.mp4` + `transcript/words-vNN.json`. Слова вне оставленных диапазонов удаляются,
 пересекающие разрез клипуются, а последующие таймкоды сдвигаются без повторного Whisper.
 Оригинал и история immutable; manifest переключается последним и очищает только устаревший
 `currentPreview`. Draft не переписывается автоматически: новая режиссура должна явно зафиксировать
 новую source revision.
+
+Черновая нарезка – проверка сокращения до motion-слоя. Её данные живут в необязательном поле
+`project.json.roughCut` (`null` или запись по `schema/project.schema.json`): список кусков
+`edit/roughcut-vNN.json` (обычный source-edit, NN – 2–3 цифры), копия `previews/roughcut-vNN.mp4` с тем
+же NN, их SHA-256, размер, длительность, `sourceDuration`, `status` (`review` – ждёт автора,
+`confirmed` – подтверждена) и у `confirmed` ещё `confirmedAt` и `confirmedBy` (`pult` | `chat`).
+Этап активен, пока `roughCut.sourceRevision` равна `source.revision`: первый же master поднимает
+ревизию, и запись становится историей. `validateProjectManifest` проверяет согласованность
+`status` с `confirmedAt`/`confirmedBy`, пару `editPath`↔`filePath` (до проверки путей, поэтому и без
+каталога проекта) и containment обоих путей; отсутствие файла копии паспорт не ломает.
+Чистая модель `scripts/project/rough-cut-model.js` (без чтения диска и без `workspace.js`, чтобы не
+было цикла require) переводит секунды нарезки в секунды исходника (`roughCutTimeToSource`),
+перечисляет вырезы с причинами из `note` (`removedRanges`), считает размер копии `roughCutSize`
+(короткая сторона 720, без увеличения, чётные стороны) и определяет охрану
+`assertRoughCutSettled` для `master` и `layer new` (ошибка с `code === 'ROUGH_CUT_PENDING'`; другое
+имя действия – обычная ошибка, чтобы опечатка не снимала охрану). Охрана подключена: `buildMaster`
+вызывает её сразу после чтения паспорта, до слота очереди, а `layer new` – сразу после `projectFrom`,
+до папки слоя. Пока нарезка ждёт автора, отказывают обе команды; после подтверждения master
+разрешён, а `layer new` ждёт, пока master не поднимет ревизию исходника.
+
+`automontage roughcut` (`scripts/project/rough-cut-cli.js` → `buildRoughCut` в
+`scripts/project/rough-cut.js`) собирает копию нарезки, не создавая ревизии исходника. До слота
+очереди: имя `edit/roughcut-vNN.json` (абсолютный `--edit` внутри проекта сначала переводится в
+относительный), та же `validateSourceEdit`, что у master, FPS исходника и отказ, если
+`previews/roughcut-vNN.mp4` уже есть (нужен `edit/roughcut-v(NN+1).json`). Размер копии –
+`roughCutSize(workingSize(displayDimensions + orientedSampleAspectRatio, '1080p'))`, то есть повёрнутая
+телефонная запись даёт портретную копию. Затем слот общей очереди `roughcut <папка>` (до project
+mutation lease, отпускается в `finally`) и под lease, по образцу `publishSourceRevision`: сверка
+активных `source.revision`/`localPath` и SHA-256 байтов списка, `runTrim()` тем же графом
+`buildConcatFilter` (`audioFadeSec: 0.04`, `precision: 6`, `scale`) в
+`previews/.roughcut-vNN-<token>.tmp.mp4`, но с `encoder: 'proxy'` (`-preset ultrafast -crf 26
+-pix_fmt yuv420p`, `aac -b:a 128k`, `-movflags +faststart`; по умолчанию `encoder: 'master'` с
+прежними аргументами); если у стадии остался флаг поворота (FFmpeg 7.1.0/7.1.1 поворачивает кадры,
+но оставляет флаг), одна перепаковка без перекодирования `-display_rotation 0 -i <стадия> -map 0
+-c copy -movflags +faststart` во вторую стадию `.roughcut-vNN-<token>.upright.tmp.mp4` и удаление
+первой; затем полное декодирование `ffmpeg -f null`, сверка длительности
+(`max(0.08, 1/fps)`), FPS, размера копии и размера показа (`displayDimensions` при повороте 0),
+повторная сверка байтов списка, `linkSync` в итоговое имя
+и последней – запись `roughCut` со `status: review` (`purpose: 'rough-cut-manifest'`). Ошибка на любом
+шаге убирает обе стадии и не меняет паспорт. `confirmRoughCut(workspace, { expectedSha256, by })` под
+lease ставит `confirmed` с `confirmedAt`/`confirmedBy` только для активной записи в `review`
+(иначе `code: 'ROUGH_CUT_MISSING'`) и только если байты копии равны `sha256`, байты списка –
+`editSha256`, а заданный `expectedSha256` – `sha256` (иначе `code: 'ROUGH_CUT_CHANGED'`).
+`automontage roughcut confirm` вызывает её с `by: 'chat'`, маршрут пульта
+`POST /api/roughcut/confirm` – с `by: 'pult'` (раздел 3.4).
+
+`scripts/project/clean.js` (`automontage clean`) чистит диск у готовых роликов. Планировщик
+`planProjectCleanup` берёт только проекты, которые пульт считает готовыми (`deriveVariantStatus`
+из `scripts/pult/status.js` и новые правки из `scripts/pult/comments.js`), без lock и старше
+`--min-age-days`, и по правилам уровня (`renders` или `archive`) перечисляет их файлы; симлинки не
+проходятся. На `archive` ссылки текущего и отрендеренного ТЗ и всех `layer.json` держат ревизии
+исходника и наборы b-roll. Без `--yes` команда только печатает отчёт. С `--yes` `applyCleanup`
+заново строит план каждого проекта, удаляет только файлы из обоих планов, обычные и внутри
+проекта, и собирает ошибки отдельных файлов в отчёт вместо остановки.
 
 Монтаж из нескольких дублей использует ту же границу. `scripts/project/takes.js` импортирует
 дубли в `input/takes/`, расшифровывает каждый в `transcript/takes/take-NN.json` и регистрирует их в
@@ -198,10 +256,13 @@ Draft имеет отдельную непередаваемую в final воз
 текущий зарегистрированный draft, выбирает `ReelScenes` или `MotionReel` по `briefs[].kind`
 через `scripts/project/brief-contract.js` и готовит props через закрытую preview-boundary,
 материализует медиа в том же изолированном bundle и выполняет Remotion → `finish.js` →
-`mix-music.js`. Отличия только технические: `--scale=0.5`, CRF 28 и детерминированная отметка
+`mix-music.js`. Отличия только технические: `--scale=min(1,1920/max(width,height))`, CRF 28 и детерминированная отметка
 «ЧЕРНОВИК». После полного decode immutable revision и `previews/current-preview.mp4` публикуются
 атомарно, а manifest обновляет только `currentPreview`; `renders`, `latestRender` и `final`
-недоступны этой границе. Approved builder по-прежнему отклоняет draft.
+недоступны этой границе. Approved builder по-прежнему отклоняет draft. Проверка просмотра перед approval использует
+тот же масштаб через `previewScale`, а хеши и подтверждение просмотра остаются обязательными.
+Перед decode и публикацией lesson-preview проходит барьер `scripts/qa/preview-gates.js`
+(гейт L и G8, раздел 3.5): стоп строг только для слоя kit из реестра `qa/layer-imports.json`.
 
 Preview не имеет отдельного HTML- или FFmpeg-дизайна: такие имитации могли бы показать не тот
 монтаж, который затем соберёт final. И preview, и final используют одну соответствующую kind композицию,
@@ -413,7 +474,18 @@ Remotion по умолчанию переносит все поля корнев
 resolver находит установленный `@remotion/cli` через Node package lookup (включая hoisted npm
 installation), проверяет имя пакета и containment entrypoint, затем явно задаёт `config/remotion-public.env` без значений. Эта граница действует
 для preview, final, chunks и still; разрешённые `REMOTION_*` настройки сохраняются. Ключи
-провайдеров также исключены из наследуемого окружения preview-job. Реальный ключ не входит
+провайдеров также исключены из наследуемого окружения preview-job. Из stderr preview-job в браузер
+уходит только русская причина остановки барьером проверок («preview не опубликован: …», код
+`PREVIEW_BLOCKED`, поле `reason` без абсолютных путей проекта и движка); любой другой сбой остаётся
+голым `PREVIEW_FAILED`. Каждое чтение состояния Review (`/api/state`, опрос `preview-job`)
+попутно убирает брошенные stage импорта под project mutation lease, но пока preview-job идёт,
+эта уборка пропускается: публикация preview берёт тот же lease без ожидания, и опрос статуса не
+должен его перехватывать. `resolveProjectPath` проверяет путь несколькими обращениями к диску;
+если запись исчезла посреди проверки (`ENOENT`/`ENOTDIR`, например чужой процесс отпустил lease),
+проверка повторяется целиком, до трёх повторов, каждый раз с отказом symlink и выхода за проект.
+Остаточный `ENOENT` при поиске lease-файла превращается в `PROJECT_MANIFEST_CONFLICT`, пока папка
+проекта существует: занятый или только что освобождённый lease – это конфликт, а не сбой. Если
+пропала сама папка проекта, наружу уходит исходная ошибка, а не «повторите». Реальный ключ не входит
 в браузерную модель или код сцены; regression проверяет поведение установленного Remotion
 с синтетическим ключом во временном fixture-проекте.
 Префикс `REMOTION_*` предназначен только для публичных значений. Настройки с этим префиксом из
@@ -628,7 +700,7 @@ flowchart LR
   S --> C["catalog: project.json + pult-card.json"]
   S --> K["projects/.pult: state, cache, instance, serve.log"]
   S --> M["projects/&lt;id&gt;/pult: comments.json, frames"]
-  S --> B["approveBrief движка"]
+  S --> B["approveBrief и confirmRoughCut движка"]
   S --> R["Review Workbench в том же процессе"]
   A["Агент"] --> X["automontage inbox"] --> M
   X --> K
@@ -687,6 +759,29 @@ flowchart LR
   а nextStep карточки заменяется на `Утверждено, в архиве – агент соберёт финал по вашей
   просьбе` только без невыполненных правок – иначе он остаётся обычным `Ждёт агента: …`, не
   трогая сами entries каталога.
+- Черновая нарезка (раздел 3.2) – отдельный вид видео `roughcut`. Пока этап активен и копия
+  лежит на диске, статус берётся из `roughCut.status` (новые правки по-прежнему первыми):
+  `review` – «Ждёт меня», «Черновая нарезка – посмотрите и отметьте оговорки»; `confirmed` –
+  «В работе», «Нарезка подтверждена – агент собирает слой». На экране – копия нарезки, и
+  `approvable` ложно: утвердить можно только preview, билета утверждения у нарезки нет. Вариант
+  получает `roughCutConfirmable` (нарезка в `review` и видео играет), `roughCutConfirmedAt`
+  (ISO-время подтверждения из `roughCut.confirmedAt`, пока нарезка `confirmed`, иначе `null`;
+  по нему `roughCutBlock` в `pult/app.js` вместо кнопки рисует отметку «✅ Нарезка подтверждена
+  в HH:MM» по местному времени браузера, а фоновое обновление заменяет блок при смене билета или
+  этого времени), `roughCutCuts` (время выреза в нарезке, сколько секунд убрано, причина из
+  `note` не длиннее 500 знаков) и `roughCutTicket` – HMAC того же секрета сессии от `key\0roughcut\0editPath\0sha256`: новая
+  нарезка делает старый билет недействительным, а слово `roughcut` не даёт выдать билет нарезки
+  за билет утверждения и наоборот. `POST /api/roughcut/confirm` принимает ровно
+  `{key, ticket, confirmViewed}` (`confirmViewed` не `true` – `400 CONFIRMATION_REQUIRED`) и
+  проходит те же три шага, что и утверждение: билет (иначе `409 ROUGHCUT_CHANGED`), байты
+  отдаваемой копии против `roughCut.sha256` (иначе `409 ROUGHCUT_DAMAGED`) и
+  `confirmRoughCut(workspace, { expectedSha256, by: 'pult' })`. Отказ движка сначала сверяется с
+  билетом текущей записи: нарезка сменилась или `ROUGH_CUT_MISSING` (гонка с master) –
+  `409 ROUGHCUT_CHANGED`; `ROUGH_CUT_CHANGED` при актуальном билете (байты копии или списка
+  кусков, который правили после сборки) – `409 ROUGHCUT_DAMAGED`, обновление страницы тут не
+  поможет; `PROJECT_MANIFEST_CONFLICT` – `409 PROJECT_BUSY`; остальное – `500 INTERNAL`, в лог
+  – только класс ошибки. Подтверждает нарезку только человек этой кнопкой или словами в чате
+  (`automontage roughcut confirm`); агент маршрут не вызывает.
 - Сервер слушает только `127.0.0.1`, требует `Bearer`-токен для API (для медиа – `?token=`,
   потому что `<video>` и `<img>` не шлют заголовки), проверяет `Host` на всех маршрутах и
   `Origin` на изменяющих. Тело запроса – JSON до 64 KiB ровно с ожидаемыми полями. Файлы
@@ -701,7 +796,8 @@ flowchart LR
   'self'` в CSP уже разрешает его загрузку без отдельного `font-src`.
 - Пульт ничего не удаляет и не перемещает в папках роликов. Он пишет только `projects/.pult/`
   (`state.json` архива, `cache/`, `instance.json`, `starting.lock`, `serve.log`) и
-  `projects/<id>/pult/` (`comments.json`, `frames/`); утверждённый brief создаёт движок.
+  `projects/<id>/pult/` (`comments.json`, `frames/`); утверждённый brief и подтверждение
+  черновой нарезки в `project.json` записывает движок.
   Симлинк вместо `.pult` или `pult/` отклоняется до записи и до чтения кэша, служебные JSON
   читаются без следования симлинку.
 - Живой экземпляр описывает `instance.json` (права `0600`: pid, порт, токен). `checkHealth`
@@ -738,6 +834,195 @@ flowchart LR
   вырезаются из каждого значения, которое попадает в терминал: текста правки, названия, путей
   папки, brief, видео и кадра, id. `comments.json`, где путь видео содержит управляющие символы,
   начинается с `/` или `\` или содержит сегмент `..`, считается повреждённым.
+  Правка с видом `roughcut` печатается как «к черновой нарезке» и получает секунду исходника:
+  `buildInbox` берёт список кусков именно этой копии (`editPathForRoughCutVideo` от пути видео
+  из самой правки, не текущая нарезка), читает его через `resolveProjectPath` (`mustExist`,
+  файл, без симлинков) и переводит секунду через `roughCutTimeToSource`. Результат – поля
+  `sourceTimeSec` и `sourceRevision` (из списка), строка получает «(в исходнике ревизии N:
+  M:SS.СС)» (`formatSourceTime`); старая правка, помеченная «к прежней версии видео», всё равно
+  считается по своему списку. Список не читается (нет файла, битый JSON, пустой или
+  пересекающийся список, нет ревизии, симлинк) – поля `null` и строка без секунды исходника.
+  Подтверждённая нарезка без master (`entry.roughCut.status === 'confirmed'`, этап активен) даёт
+  элементу `roughCutConfirmed` (путь списка) и строку «Нарезка подтверждена: …»: она не зависит
+  ни от `needsFinal`, ни от архива (кнопка «Нарезка готова» – явное решение автора, как и
+  правки), а после master, когда ревизия исходника выросла, исчезает. Нарезка в `review`
+  строки не даёт – ход за автором, и папка без правок во входящих не появляется.
+
+### 3.5 Motion-kit слой и гейты
+
+Пошаговая работа, контракт `plan.js`, пороги всех гейтов и разбор сообщений – в
+[docs/MOTION-KIT.md](docs/MOTION-KIT.md). Здесь – модули, поток данных и границы доверия.
+Почему устроено так – D-034…D-040 в [DECISIONS.md](DECISIONS.md).
+
+```mermaid
+flowchart TD
+  P["projects/&lt;id&gt;: исходник + transcript/words.json"] --> N["layer new"]
+  N --> L["motion-vNN/: layer.json, words.js, sfx-library.js, plan.js, scenes.jsx, public/"]
+  L --> C["plan.js → compilePlan (core)"]
+  C --> R["Remotion: src/index.jsx → src/Root.jsx"]
+  C --> M["layer check: buildLayerManifest → out/manifest.json"]
+  M --> T["timeline-gates: G1–G5, G9–G11"]
+  T --> W["layer render: ожидание машины → заявка номера"]
+  W --> R
+  R --> Z["нормализация ffmpeg → renders/layer-NN.mp4"]
+  Z --> G["media-gates: G6, G7"]
+  G --> I["layer import: importReviewMedia + qa/layer-imports.json"]
+  I --> B["layer brief: draft, одна сцена broll"]
+  B --> V["automontage preview: Remotion → finish.js → mix-music.js"]
+  V --> Q["preview-gates: L + G8"]
+  Q -->|пройдено или не слой kit| U["публикация preview"]
+  Q -->|стоп слоя kit| S["preview не опубликован, прошлый остаётся"]
+  U --> H["layer sheet: контакт-лист, G12"]
+```
+
+- **Kit.** `src/motion-kit/` – ESM. `core.js` реэкспортирует только чистые модули (`time`,
+  `words`, `safe`, `camera`, `motion`, `inserts`, `sfx`, `captions`, `compile`, `manifest`,
+  `screen`), `index.js` добавляет React-компоненты: `SpeakerLayer`, `KitBox`, `FullscreenReveal` и
+  `StockInsert` (модуль `Inserts.jsx`), `BrowserFrame`, `ScrollShot` и `ShutterFlash` (модуль
+  `Screen.jsx`), `SfxTrack`, `Subtitles`, `FontLoader`. Слой подключает kit по имени
+  `@automontage/motion-kit`: Remotion – через webpack alias `withMotionKitAlias`
+  (`scripts/remotion-webpack.js`; каталог kit `remotion.config.js` считает от текущей папки,
+  поэтому рендер идёт из корня движка), Node – через alias esbuild в `scripts/motion-kit-node.js`.
+  Из остального движка kit берёт только `src/scenes/safezone.js`, и safe-зона у kit и lesson-сцен
+  одна.
+- **Одна сборка на две стороны.** `compilePlan(buildPlan, ctx)` превращает план в дорожки по
+  кадрам: камера, элементы, вставки, звуковые события, субтитры, исключения (`KIT_VERSION` из
+  `compile.js`). Её вызывают и `src/Root.jsx` слоя (что рендерится), и `buildLayerManifest`
+  (что проверяется), поэтому гейт судит ровно тот таймлайн, который потом рендерится.
+  `buildLayerManifest` синхронно собирает `plan.js` через esbuild `buildSync` с metafile,
+  проверяет границу импортов `findPlanViolation` (только `@automontage/motion-kit/core` и файлы
+  слоя, `process.env` пуст) и отдаёт `buildManifest` из kit. Граница – ограждение от случайностей,
+  а не песочница: `layer check` выполняет `plan.js`. `loadKitCore` так же собирает `core` для
+  слов и написания из транскрипта (`layer words`, `layer new`) и проверки `sfxMasterDb` в
+  `layer.json`.
+- **`layer new`** (`scripts/layer/new.js`) нерекурсивно занимает следующую `motion-vNN` (номера не
+  переиспользуются), копирует `templates/motion-layer/` (`src/index.jsx`, `src/Root.jsx`,
+  `src/plan.js`, `src/scenes.jsx`, `README.md`), исходник в `public/speaker.mp4`, шрифты, звуки
+  библиотеки (`scripts/layer/sfx-library.js`, только в пустую папку) и заглушки стока и скриншота,
+  пишет `src/words.js`, `src/sfx-library.js` и `layer.json` с `source` (путь, sha256, размер,
+  mtime, ревизия исходника). Прерванная команда убирает недостроенную папку.
+- **Привязка к исходнику.** `assertLayerSource` (`scripts/layer/common.js`) сравнивает
+  `layer.json.source` с текущим исходником проекта (путь и ревизия, при другом размере или mtime –
+  sha256); `layer words`, `layer check` и `layer render` на другом исходнике отказываются.
+- **`layer check`** (`scripts/layer/check.js`) удаляет прошлый манифест, пишет новый
+  `out/manifest.json` и прогоняет `runTimelineGates` (`scripts/qa/timeline-gates.js`: G1–G5,
+  G9–G11, исключения через `applyWaivers`), дополнительно меряя ffprobe клипы stock-вставок для
+  G10. Любой отказ сборки или формы манифеста – отчёт с `error`, код 2.
+- **Машинная очередь** (`scripts/heavy-queue.js`, D-044) общая для `layer render`,
+  `layer import`, `preview`, final render (lesson и Dynamic), `master` и `roughcut`. Атомарные
+  project mutation leases папок `slot-0` … `slot-(N-1)` исключают одновременное занятие слота,
+  recovery использует тот же identity-проверенный протокол, но смерти оркестратора недостаточно.
+  `heavy-execution.js` пишет intent в `.execution-<lease-token>/` до запуска;
+  `heavy-worker.js` становится POSIX group leader и подтверждает PGID до запуска инструмента.
+  Общие sync `process.js` и async `review/media-process.js` используют этот supervisor.
+  Через наследуемый Node preload `heavy-child-preload.js` регистрирует дополнительные
+  `spawn`/`spawnSync` с `detached: true`, включая реальный запуск Chromium в Remotion.
+  Аргументы, stdio и окружение этих внутренних запусков сохраняются; добавляются только
+  внутренний execution context и preload. Никакого поиска процессов по командной строке нет.
+  Recovery и `queue` требуют ESRCH для всех записанных групп и неизменившегося списка tickets;
+  pending/повреждённые записи, ошибки доступа и повторно использованный PGID блокируют слот.
+  Lease берётся до lease проекта. `finally` прекращает регистрацию новых запусков; если работа
+  ещё жива, token-scoped `released` разрешает reclaim лишь после её окончания, даже когда
+  оркестратор остался жив. Без потомков обычный dead-owner recovery сохраняется.
+  Supervisor пересылает SIGTERM/SIGINT/SIGHUP своей группе; после grace период заканчивается
+  принудительным завершением этой группы. Async launcher посылает escalation группе конкретного
+  живого supervisor, а на Windows управляет реальным direct child через отдельный IPC-канал.
+  Записи других запусков с тем же token не обходятся для отправки сигналов. Captured stdout/stderr
+  проходят через supervisor с backpressure и без изменения binary bytes; sync deadline/maxBuffer
+  проверяются внутри него, пока он ещё может завершить реальную работу. Native spawnSync сохраняет
+  hard-kill fallback на timeout + 1000 мс для зависшего supervisor; ETIMEDOUT/ENOBUFS сохраняют
+  stage исходного инструмента. После async timeout/abort/output overflow parent закрывает свои
+  pipes и завершает ошибку не позднее grace + 250 мс (при работающем event loop), даже если
+  отделённый потомок держит унаследованный дескриптор. Это ошибка, не доказательство завершения:
+  отдельные detached-группы не убиваются по историческим PGID и продолжают удерживать слот
+  через tickets до доказанного окончания. Соседний invocation остаётся жив.
+  Surviving descendants и аварийное завершение supervisor всё равно защищены tickets.
+  На Windows успешный запуск может убрать свои tickets только в живом исходном оркестраторе;
+  ошибка или его смерть оставляет fail-closed блокировку до ручной проверки. Job Objects нет:
+  намеренно отделённый потомок после формально успешной Windows-команды не покрывается.
+  Нативная самостоятельная daemonization и удаление preload из Node env также вне контракта.
+  Ожидание очереди не держит проект заблокированным.
+  `AUTOMONTAGE_HEAVY_DIR` задаёт общий каталог (по умолчанию `os.tmpdir()/automontage-heavy`),
+  `AUTOMONTAGE_HEAVY_SLOTS` – целое 1–8 (по умолчанию 1), `AUTOMONTAGE_HEAVY_WAIT_MS` –
+  целое ≥ 0 (по умолчанию 10800000 мс, 3 ч); проверка слота каждые 5000 мс.
+  `acquireHeavySlot` и `acquireHeavySlotSync` обслуживают async/sync команды,
+  `tryAcquireHeavySlot` пробует занять слот, `listHeavySlots` читает состояние для
+  `automontage queue`: label, PID, время начала и каталог. Label содержит только
+  `<задача> <имя папки проекта>[/<слой>]` (basename), без личного пути. Таймаут или нулевое
+  ожидание при занятости дают `HEAVY_QUEUE_BUSY` с текстом «машина занята: …».
+  Это ограничение параллельности, а не обещание FIFO; команды вне этого протокола не учитываются.
+- **`layer render`** (`scripts/layer/render.js`): сначала тот же `layer check`; затем слот
+  общей машинной очереди (`scripts/heavy-queue.js`), после ожидания – повторный `layer check`.
+  `--no-wait` отказывает при занятой очереди, а не обходит её. Слот берётся до project mutation
+  lease и освобождается в `finally`. Манифест читается в память сразу после проверки. Номер
+  рендера занимает заявка `renders/layer-NN.raw.mp4`, созданная с `wx`; в неё же Remotion пишет
+  сырой рендер. Номер с готовым файлом или отчётом не переиспользуется. Remotion запускается
+  командой `remotionLayerRenderCommand` (`scripts/build-commands.js`) поверх
+  `resolveRemotionCommand` (`scripts/env.js`): пустой защищённый `--env-file`, `--public-dir`
+  слоя, без `--props`, `cwd` – корень движка. Только `layer render` передаёт
+  `AUTOMONTAGE_LAYER_LIMITED_RANGE=1` вместе с остальным окружением: override
+  `scripts/remotion-ffmpeg-override.js` добавляет limited range/yuv420p в кодирование libx264
+  самого Remotion. Затем ffprobe проверяет `pix_fmt=yuv420p` и `color_range=tv`: ffmpeg копирует
+  соответствующее видео и нормализует только звук в AAC 48 кГц ровно на длину кадров слоя.
+  Если Remotion отдал другой формат/range, остаётся fallback с перекодированием видео.
+  `scripts/qa/media-gates.js`: G6 сравнивает
+  длину **видеопотока**, размер и FPS с исходником, G7 – звук слоя с голосом исходника по окнам
+  `cues.kept` манифеста. Заявка снимается только после записи отчёта.
+- **`layer import`** (`scripts/layer/import.js`) принимает только сам рендер: файл внутри
+  проекта, чей путь и sha256 стоят во входе `role: 'layer'` самого свежего отчёта `layer render`
+  (`findRenderReport`, `renderReportProblem` в `scripts/layer/registry.js`: целый отчёт с G6 и G7,
+  итог совпадает с гейтами, не «стоп»), а `assertReportSource` сверяет вход `source` отчёта с
+  текущим исходником. `importReviewMedia` получает внутреннюю стратегию
+  `masterStrategy: remux-if-conforming`: соответствующий H.264/yuv420p слой переупаковывается
+  без повторного кодирования master в `assets/broll/video/<id>/media.mp4`, иначе применяется
+  прежнее кодирование. WebM-прокси кодируется в четыре потока (`cpu-used=4`). HTTP-импорт Review
+  сохраняет стратегию `encode` и прежние параметры. Ограниченное по времени и выводу полное
+  декодирование master и прокси, квоты, lease и атомарная публикация остаются обязательными.
+  В реестр `qa/layer-imports.json` пишется связь
+  `renderSha256` → `canonicalSha256` целого ассета вместе с профилем, слоем и путём отчёта.
+  Реестр – единственный признак слоя kit: sha256 рендера и целого ассета проверяются отдельно,
+  даже когда видеопоток master скопирован без перекодирования.
+- **`layer stock`** (`scripts/layer/stock.js`) ищет клип клиентом Pexels из B-roll discovery,
+  режет его без звука под размер, FPS и длину вставки (`--sec`, иначе длина `--insert` из
+  `buildLayerManifest`, иначе 2,5 с) в `public/stock/` и дописывает в `public/SOURCE.md` строку из
+  четырёх ячеек: файл, лицензия и автор, страница с запросом и отрезком, SHA-256. `plan.js` не правит.
+- **`layer brief`** (`scripts/layer/brief.js`) публикует draft lesson brief прежнего формата:
+  одна сцена `broll` с `overlay: 'none'` на весь хронометраж, звук слоя `audioMode: 'mix'`, голос из
+  исходника по глобальному таймкоду, музыка по желанию. Ассет должен быть в реестре, цел и собран
+  для текущего исходника.
+- **Барьер preview** (`scripts/qa/preview-gates.js`, вызывается из `scripts/preview.js` после
+  `finish.js` и `mix-music.js`, пока lease жив, до полного decode и публикации). Гейт L сверяет
+  каждое видео сцен brief (`brollMedia`) с реестром и проверяет отчёт `layer render` записи, как
+  `layer import`; видео вне реестра с именем рендера слоя (`label` в `asset.json`) даёт только
+  предупреждение L. G8 меряет разрыв «голос – музыка» в LU по настоящим дорожкам: голос после
+  `finish.js`, музыка через `mix-music.js` в режиме `stem: 'music'` (тот же sidechain), окна речи
+  из `transcript/words.json` проекта (`scripts/qa/mix-gates.js`). Обе дорожки замера – ровно
+  длительность preview × 48000 кадров, выровненные по сэмплам (`apad,atrim=end_sample`, после конца
+  голоса тишина, как в миксе), поэтому длина и выравнивание не зависят от версии ffmpeg, а сам разрыв на
+  ffmpeg 6, 7 и 9 совпадает до сотых LU (декодеры и передискретизация версий чуть различаются). Окна речи после
+  конца голоса дают G8 «голос не звучит», а не пропуск: тишина прибавляет 0 к обеим суммам, разрыв
+  звучащих окон не меняет и двигает только число блоков и LUFS. Строгий режим – только если видео
+  сцены найдено в реестре или реестр не читается: стоп L или G8 не даёт опубликовать preview,
+  и если отчёт не записался, preview тоже не публикуется. Для остальных роликов публикация не
+  блокируется, G8 – справка со статусом `skipped` без совета по громкости, preview длиннее 180 с
+  не меряется (справочный замер – два полных декодирования во float внутри lease, а у задачи
+  preview в Review тайм-аут 10 минут). Отчёт `qa/preview-<UTC-дата-время>-NN.json|txt` пишется для каждого lesson-preview;
+  номер занимается файлом с `wx`, ошибка записи не выдаёт абсолютных путей. Входы отчёта: `source`
+  и `brief` по sha256, которые preview уже посчитал, и `layer` – `reference` и `canonicalSha256`
+  каждой записи реестра, проверенной гейтом L; пути относительно проекта. `findRenderReport`
+  такие входы не видит: он читает только `layer-*-render-NN.json`. Brief `motion-reel`
+  барьер не проходит: gates для него не запускаются, а `videoScenes` читает только `brollMedia`.
+- **`layer sheet`** (`scripts/layer/sheet.js`) работает с текущим preview проекта: контакт-лист
+  4×4 с рамкой safe-зоны, полоски по 5 кадров вокруг новых правок пульта и G12
+  (`scripts/qa/empty-frame-gate.js`: доля пикселей с перепадом яркости больше 24 на кадре,
+  уменьшенном до 135 px; кадр, для которого долю не удалось посчитать, считается пустым). Если
+  ffmpeg не отдал сам кадр контакт-листа, команда останавливается с ошибкой; иначе она только
+  предупреждает: qa-отчёт не пишет, код 0.
+- **Отчёты и коды.** `scripts/qa/report.js` строит отчёт (`buildReport`, статус `error` при
+  любой ошибке), печатает его (`formatReport`) и пишет атомарно (`writeReport`). `layer check` и
+  `layer render` возвращают 0 (пройдено или предупреждения), 1 (стоп) или 2 (оценить нельзя);
+  пороги профилей `avatar`/`live` – `scripts/qa/profiles.js`, safe-зона для CommonJS –
+  `scripts/qa/safe-rect.js`.
 
 ## 4. Remotion-слой
 
@@ -818,7 +1103,7 @@ Remotion `OffthreadVideo`. `trimBefore = round(trimStartSec × fps)`, а дли�
 | Пользовательский CLI | `scripts/cli.js`, `scripts/doctor.js` |
 | Оркестрация и процессы | `scripts/build.js`, `scripts/env.js`, `scripts/process.js`, `scripts/media-probe.js`, `scripts/source-timing.js` |
 | Папки и версии роликов | `scripts/project/workspace.js`, `scripts/project/build-context.js` |
-| Source revisions и дубли | `scripts/project/build-master.js`, `scripts/project/source-revision.js`, `scripts/project/takes.js`, `scripts/project/takes-pack.js`, `scripts/project/takes-cli.js`, `scripts/project/takes-edit.js`, `scripts/project/build-takes-master.js`, `scripts/project/take-pauses.js`, `scripts/trim-media.js` |
+| Source revisions и дубли | `scripts/project/build-master.js`, `scripts/project/source-revision.js`, `scripts/project/takes.js`, `scripts/project/takes-pack.js`, `scripts/project/takes-cli.js`, `scripts/project/takes-edit.js`, `scripts/project/build-takes-master.js`, `scripts/project/take-pauses.js`, `scripts/project/rough-cut-model.js`, `scripts/project/rough-cut.js`, `scripts/project/rough-cut-cli.js`, `scripts/trim-media.js` |
 | Транскрипция и субтитры | `scripts/transcribe.py`, `scripts/build-captions.js` |
 | Lesson brief | `scripts/gen-brief.js`, `scripts/lesson/*` |
 | Локальная проверка | `scripts/review/*`, `review/*` |
@@ -829,6 +1114,10 @@ Remotion `OffthreadVideo`. `trimBefore = round(trimStartSec × fps)`, а дли�
 | Паузы и кадрирование | `scripts/tighten.js`, `scripts/cut-pauses.js`, `scripts/reframe.py`, `scripts/face-center.py` |
 | Внешние темы | `scripts/load-ext-theme.js` |
 | Release gates | `scripts/check-release.js`, `scripts/smoke-release.js` |
+| Motion-kit (детали слоя) | `src/motion-kit/*` (чистые `core.js` и React `index.js`), `templates/motion-layer/` (стартовые файлы слоя), `scripts/remotion-webpack.js` (alias `@automontage/motion-kit`) |
+| Kit в Node | `scripts/motion-kit-node.js`: `loadKitCore`, `buildLayerManifest`, граница `plan.js` `findPlanViolation` (esbuild `buildSync` + metafile) |
+| Команды слоя | `scripts/layer/cli.js` и `new`, `words`, `check`, `render`, `import`, `brief`, `stock`, `sheet`; общие части `common.js`, `registry.js`, `sfx-library.js`; машинная очередь `scripts/heavy-queue.js`; `remotionLayerRenderCommand` в `scripts/build-commands.js` |
+| QA-гейты | `scripts/qa/profiles.js`, `report.js`, `safe-rect.js`, `timeline-gates.js` (G1–G5, G9–G11), `audio.js`, `media-gates.js` (G6, G7), `mix-gates.js` (G8), `preview-gates.js` (барьер L + G8), `empty-frame-gate.js` (G12) |
 
 Длинный рендер хранит части в `out/.chunks/<job-sha256>/`. Cache descriptor v2 включает
 composition, канонизированные props, identities source/audio, диапазоны и Remotion options,
@@ -854,9 +1143,9 @@ symlink; symlink прерывает построение cache key.
   создаёт движок через `approveBrief`.
 - Локальный batch index – игнорируемый сводный указатель на независимые project workspace; он не
   заменяет их manifest, не является release asset и не попадает в Git.
-- `project.json` – журнал относительных project-путей, статусов brief и рендеров. Только
-  `source.originalPath` и `takes[].originalPath` хранят исторические абсолютные
-  пути исходника и дублей.
+- `project.json` – журнал относительных project-путей, статусов brief и рендеров, а также записи
+  черновой нарезки `roughCut` (раздел 3.2). Только `source.originalPath` и `takes[].originalPath`
+  хранят исторические абсолютные пути исходника и дублей.
 - `input/takes/take-NN.<ext>` (начиная с take-02; take-01 ссылается на оригинальный исходник
   проекта) и `transcript/takes/take-NN.json` (для всех дублей) – неизменяемые копии дублей и их
   локальные транскрипты; `edit/vNN-source.json` и `edit/vNN-takes.json` – входы `automontage
@@ -872,6 +1161,18 @@ symlink; symlink прерывает построение cache key.
   не пишет: source и утверждённые local scene media копируются в owner-only системный temp
   `os.tmpdir()/automontage-render-*/public/.automontage/<safe-namespace>-<uuid>/media-N.<ext>`, а абсолютный
   temp `public` передаётся Remotion отдельным `--public-dir` argv и не попадает в props.
+- `projects/<id>/motion-vNN/` – слой motion-kit (игнорируется Git вместе с `projects/`):
+  `layer.json`, `spelling.json`, `src/`, `public/` (`speaker.mp4`, шрифты, `sfx/`, `stock/`,
+  `shots/`, `SOURCE.md` с лицензиями и SHA-256), `out/manifest.json` (манифест гейтов, пишет
+  `layer check`) и `renders/layer-NN.mp4` (пишет `layer render`; заявка
+  `renders/layer-NN.raw.mp4` занимает номер и принимает сырой рендер Remotion, остаётся только
+  после прерванного рендера и тогда может содержать недописанное видео).
+- `projects/<id>/qa/` – отчёты гейтов `<имя>.json` + `.txt`: `layer-<слой>-check`,
+  `layer-<слой>-render-NN`, `preview-<UTC-дата-время>-NN` (для каждого lesson-preview); реестр
+  проверенных слоёв `layer-imports.json` (пишет только `layer import`); контакт-листы
+  `sheet-<8 знаков sha256 preview>.jpg` и полоски `sheet-<…>-comment-<id правки>.jpg`.
+- `projects/.library/sfx/` – локальная библиотека звуков слоя по умолчанию (`<имя>.wav` и
+  необязательный `library.json`); в Git не входит.
 - `out/` – legacy/cache-путь для запуска без `--project` и `--project-dir`.
 - `tmp/` – промежуточные файлы.
 - `examples/` – небольшие публичные входы для проверки установки.
@@ -887,7 +1188,100 @@ portable descriptor-relative `unlinkat`/`rmdirat`, поэтому между п�
 Но `tmp/` и legacy-пути пока общие, поэтому один checkout по-прежнему допускает только одну
 активную сборку. Для параллельных рендеров нужны отдельные clone/worktree.
 
-## 7. Переменные окружения
+## 7. Лид-магниты: данные и команды
+
+`check` читает каждый вложенный файл через проверку границ projects и дескриптор без следования
+симлинкам. Chromium получает снимок HTML из памяти; снимки PNG возвращаются как Buffer и
+публикуются через staged writer с проверкой identity родителей до и после асинхронной работы.
+`qa/check.json` содержит `inputSha256` — отпечаток promise, units, списка выбранных текстов и
+их содержимого; approval пересчитывает его вместе с page/facts hashes. `factsSha256: null`
+разрешён только для неуспешного отчёта, когда факты отсутствуют или невалидны. `updatePromise`
+принимает `units` в существующем объекте options и сохраняет их атомарно вместе с promise;
+CLI всегда передаёт единицы выбранного offer.
+
+Модуль `scripts/lead-magnet/` хранит обещания, решения, библиотеку, проверки и агентский CLI.
+Навык `skills/lead-magnet/SKILL.md` ведёт агента по запросу из `automontage inbox`:
+`brand` → `create` → `revision start` → референсы → `revision scaffold` → содержание и
+проверенные факты → `pdf` → `check` → `revision publish` → `inbox --accept-lead`.
+`scaffold.js` строит самодостаточные `page.html` и `content.md` из бренд-пака, встраивает
+локальные шрифты и логотип, подставляет slug кодового слова в UTM. `pdf.js` печатает
+готовую страницу в Chromium без сети и защищает чтение страницы и публикацию PDF от подмены
+пути. `reference-tools.js` переносит подтверждённые файлы по SHA-256 и делает ограниченные
+снимки URL или загруженного HTML; HTML открывается без сети и скриптов, снимки записываются
+с проверкой пути от `projectsDir` и идентичности всех родительских каталогов,
+зафиксированной до запуска браузера. `check.js` отвергает оставшиеся `data-lm-todo`.
+
+Поток данных: агент сохраняет обещание с цитатой и таймкодом в
+`projects/<ролик>/lead-magnet/offers.json` → решение человека записывается в
+`projects/<ролик>/pult/lead-magnet.json` → запрос попадает в `automontage inbox` → агент
+создаёт материал в общей библиотеке `projects/.lead-magnets/<id>/` → открывает ревизию
+`vNN/`, создаёт заготовку и файлы, печатает PDF → `check` проверяет страницу настоящим Chromium и факты
+→ `revision publish` показывает черновик → человек утверждает его в пульте. Доступны браузерные
+экраны пульта, навык агента, заготовка, PDF и инструменты референсов.
+У CLI нет команды утверждения: сервер требует HMAC-пропуск человеческого действия.
+
+Необязательное `params.cta` хранит режим `brand`/`link`/`none` и поля `title`, `label`, `url`.
+Без поля применяется `brand`. Сервер нормализует свою HTTPS-ссылку без credentials и очищает
+поля остальных режимов. Схема параметров общая для запросов и паспортов. Бренд-пак содержит
+обязательный массив `socials`; scaffold всегда оставляет нижний `data-lm="cta"`, добавляет
+значки соцсетей и применяет UTM только к главным кнопкам с сохранением query и fragment.
+Состояние пульта отдаёт подписи `brand.call`, `brand.socials` и `lastLink` из первого паспорта
+со своей ссылкой в библиотеке, отсортированной от новых к старым.
+
+### Пульт лид-магнитов (сервер)
+
+`scripts/pult/lead-magnet-view.js` собирает индекс общей библиотеки, состояние для папки
+ролика и короткую сводку для карточек. Раздел карточки выбирается по самому срочному
+состоянию видео и лид-магнита. `scripts/pult/lead-magnet-routes.js` отдаёт состояние,
+принимает решения, референсы и правки, выдаёт страницу и утверждает ревизию. Сервер
+`scripts/pult/server.js` подключает эти маршруты. `pult/lead-magnet.js` содержит экраны
+лид-магнита и подключается в `pult/index.html` до `app.js`.
+
+| Маршрут | Данные или действие |
+|---|---|
+| `GET /api/cards` | У варианта `leadMagnet: { ask, status, nextStep }` или `null`; у карточки `leadMagnetAsk` |
+| `GET /api/lead-magnet?key=` | Полное состояние вкладки: обещания, ревизии, тексты, файлы, правки и воронка |
+| `POST /api/lead-magnet/decision` | Решение по обещанию, готовому материалу или воронке |
+| `POST /api/lead-magnet/reference?key=` | Референс сырыми байтами `application/octet-stream` |
+| `POST /api/lead-magnet/comment`, `/api/lead-magnet/comment/delete` | Правка к блоку или тексту и её удаление |
+| `POST /api/lead-magnet/approve` | Утверждение просмотренной ревизии по отдельному пропуску |
+| `POST /api/lead-magnet/reveal` | Показать допустимый файл ревизии в папке |
+| `GET /lm/page?id=&rev=&ticket=` | Живая страница в изолированном iframe, без главного ключа пульта |
+| `GET /media/lm-snapshot?id=&comment=&token=` | Снимок места правки |
+
+`revisionReadiness` в `scripts/lead-magnet/readiness.js` – единое правило готовности для
+сводки пульта и `approveLeadMagnet`: сверяет байты страницы, факты, отпечаток исходных
+параметров и все обязательные пункты зелёного отчёта. Это исключает расхождение между
+показанной готовностью и проверкой при утверждении. `/lm/page` сверяет HMAC-пропуск с id,
+ревизией и SHA-256 текущей страницы; отдельная CSP разрешает скрипты внутри sandbox,
+запрещает сетевые подключения и допускает встраивание только самим пультом. При выдаче
+страницы сервер добавляет скрипт для выбора блока правки. API и снимки остаются под
+обычной проверкой ключа пульта.
+
+| Схема в `schema/` | Данные |
+|---|---|
+| `lead-magnet-offers.schema.json` | Дословные обещания ролика |
+| `lead-magnet-requests.schema.json` | Решения по обещаниям |
+| `lead-magnet.schema.json` | Паспорт материала в общей библиотеке |
+| `lead-magnet-brand.schema.json` | Приватный стиль и CTA |
+| `lead-magnet-facts.schema.json` | Проверенные утверждения и источники |
+| `lead-magnet-check.schema.json` | Результат проверки каркаса и фактов |
+| `lead-magnet-comments.schema.json` | Правки к блокам и текстам |
+| `lead-magnet-funnel.schema.json` | Прочитанное состояние воронки |
+
+Одинаковое кодовое слово может принадлежать разным материалам: совпадения только
+предлагаются, `link` требует явного выбора. Решения `link` и `promise-keep` выполняются
+сразу и не появляются во входящих; `create` всегда создаёт новый материал, а
+`promise-refresh`, `funnel-check` и комментарии требуют работы агента. Формат файлов и
+порядок команд описаны в [docs/LEAD-MAGNET.md](docs/LEAD-MAGNET.md).
+При сохранении правки PNG-снимок остаётся связан с временным файлом до записи
+`comments.json`: если запись JSON сорвётся, движок удалит только свой PNG, а inode
+снимка не сможет достаться чужой замене по тому же пути до завершения отката.
+Очистка временной ссылки выполняется отдельно от отката PNG; при подмене родительского
+каталога движок не удаляет файл через новый путь. После сохранения JSON каталог снимков
+проверяется ещё раз: при подмене операция возвращает ошибку, даже если JSON уже записан.
+
+## 8. Переменные окружения
 
 Ниже перечислены пользовательские runtime-переменные. Pexels-настройки читаются из окружения
 или локального `.env`; системный `PATH` и внутренние test hooks из `.env.example` пользователю
@@ -903,12 +1297,14 @@ portable descriptor-relative `unlinkat`/`rmdirat`, поэтому между п�
 | `OPENVERSE_CLIENT_ID` | зарезервировано | будущий провайдер, в 1.6.0 не читается рабочим кодом |
 | `OPENVERSE_CLIENT_SECRET` | зарезервировано | будущий провайдер, в 1.6.0 не читается рабочим кодом |
 | `THEMES_EXT` | опционально | корневая папка внешних тем `<id>/theme.json` |
+| `LEAD_MAGNET_BRAND` | опционально | приватная папка бренд-пака лид-магнитов; без неё ищется `lead-magnet/` рядом с `THEMES_EXT`, затем нейтральная тема |
 | `AUTOMONTAGE_FFMPEG_DIR` | опционально | каталог отдельной `ffmpeg` + `ffprobe`; CLI ставит его первым в дочерний `PATH` |
+| `AUTOMONTAGE_SFX_DIR` | опционально | папка библиотеки звуков для `layer new`; по умолчанию `projects/.library/sfx`. Заданная переменная с несуществующей папкой – ошибка; без переменной и без папки по умолчанию слой собирается без звуков |
 
 Dynamic, канонический lesson через текущую подписку Claude Code/Codex, Review, preview, render,
 QA и `automontage demo` работают без provider API-ключей.
 
-## 8. Внешние зависимости
+## 9. Внешние зависимости
 
 - Node.js 20+ и npm – CLI, тесты, Remotion.
 - Python 3 + пакеты из `requirements.txt` – Whisper/OpenCV-сценарии.
@@ -917,6 +1313,9 @@ QA и `automontage demo` работают без provider API-ключей.
 - ffmpeg/ffprobe – анализ, аудио, нормализация импорта, сборка и контроль результата. Для фото
   в Review обязателен encoder `libwebp`; video import также использует `libx264`, `libvpx`,
   `libopus` и AAC. `automontage doctor` проверяет WebP и объясняет выбор отдельной полной сборки.
+- esbuild 0.28.1 (явная закреплённая зависимость) – сборка kit и `plan.js` слоя в Node для
+  команд `layer` (`scripts/motion-kit-node.js`). Грузится лениво, только при сборке: `automontage
+  preview` тянет реестр слоёв (`layer/registry` → `layer/common`), но esbuild не загружает.
 - Chromium для Playwright – browser regression tests и пересборка PNG-моков скриптами
   `shot-*`; обычный Review открывается в установленном системном браузере.
 - Tesseract OCR локально проверяет изображения и три кадра выбранного видео на встроенный текст.
@@ -924,7 +1323,7 @@ QA и `automontage demo` работают без provider API-ключей.
 - Официальный Pexels API является единственным сетевым провайдером рабочего B-roll-поиска в
   1.6.0. Pixabay/Openverse объявлены только как зарезервированные будущие интеграции.
 
-## 9. Инварианты безопасности и качества
+## 10. Инварианты безопасности и качества
 
 - Тексты и числа lesson-сцен происходят из транскрипта, а не из фантазии модели.
 - Draft рендерится только через отдельный `automontage preview` в `previews/`; final builder
@@ -947,7 +1346,7 @@ QA и `automontage demo` работают без provider API-ключей.
   описывают в `SECURITY.md`. `tests/palette-security.test.js` не даёт вернуть в
   `package-lock.json` цепочку `node-vibrant` и `file-type` ниже 21.3.1.
 
-## 10. Как расширять
+## 11. Как расширять
 
 - Новая встроенная тема: добавить файл в `src/theme/` и зарегистрировать в `src/theme/index.js`.
 - Приватная тема: положить `<theme-id>/theme.json` вне репозитория и задать `THEMES_EXT`.
@@ -956,3 +1355,5 @@ QA и `automontage demo` работают без provider API-ключей.
 - Новая официальная lesson-сцена: это изменение продуктового контракта. Нужны компонент,
   адаптив обеих ориентаций, safe-zone, brief-схема, нормализация в `gen-brief`, тесты,
   обновление `docs/TEMPLATES.md` и отдельное решение в `DECISIONS.md`.
+
+Рабочий размер master учитывает SAR после поворота: в режиме 1080p сжимает одну ось до квадратных пикселей без увеличения кадра; source сохраняет SAR. `previewSize` повторяет чётное округление H.264 в Remotion и используется при публикации и approval.

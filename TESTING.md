@@ -11,10 +11,60 @@ npm test
 ```
 
 `npm test` использует встроенный Node test runner и запускает `tests/*.test.js`.
+На машине с ограниченной памятью используйте `npm test -- --test-concurrency=2`.
+Тесты запускайте без личного `LEAD_MAGNET_BRAND`: CLI-фикстура пока наследует его
+(известный баг #76); на macOS/Linux: `env -u LEAD_MAGNET_BRAND npm test`.
+Настройки рабочего пульта и бренд-пак не меняются.
+
+`npm test` и `npm run test:video-edit` загружают `tests/helpers/heavy-queue-isolation.cjs`:
+каждый тестовый файл получает отдельный временный каталог очереди, дочерние CLI наследуют
+его; каталог удаляется при выходе. Playwright использует отдельный root-bootstrap:
+он принудительно создаёт свежую очередь даже при входящем `AUTOMONTAGE_HEAVY_DIR`,
+а workers и их дети наследуют её. Production sentinel проверяется в
+`heavy-queue-isolation.test.js`. Для отдельного теста сохраняйте preload:
+
+```bash
+node --require ./tests/helpers/heavy-queue-isolation.cjs --test tests/heavy-queue.test.js
+```
+
+Очередь и оптимизации покрывают `heavy-queue.test.js` (межпроцессное исключение,
+освобождение, мёртвый PID, таймаут, sync/async, CLI `queue` и настройки). Его реальные
+дешёвые child-process regressions завершают только собственный surrogate-owner по SIGTERM:
+child, grandchild и detached-grandchild удерживают очередь до окончания работы для обоих
+launchers. Проверяются pending intent, старый token, binary pipes, argv/env и ожидание shutdown
+при abort. Это проверка изменённого lifecycle без дорогого полного медиа-рендера; прежние
+замеры качества/скорости остаются историческим свидетельством обычного пути. Native Windows
+и полное дерево Job Objects этой проверкой не сертифицируются.
+`build-security.test.js` и `lesson-build.test.js` подменяют managedInvocation вместе с
+своим spawnSync: их заглушки не запускают процессы и не должны создавать pending tickets.
+Реальный lifetime проверяется только отдельными cross-process regressions выше.
+`heavy-execution-timeout.test.js` запускает собственные Node-процессы, игнорирующие SIGTERM:
+реальные async timeout/abort/stdout/stderr limits обязаны завершить настоящую работу задолго до
+её естественного выхода через 3 секунды. Windows CI запускает эти четыре async-сценария вместе
+с portable media lifecycle; их native результат появится только после выполнения hosted job.
+На POSIX локально также проверяются sync timeout/maxBuffer (capture и runTool), сохранение
+соседнего invocation в том же слоте и bounded rejection при отдельном потомке с открытым pipe:
+очередь остаётся занята до окончания этого потомка. Эти POSIX-сценарии явно пропускаются на
+Windows и не сертифицируют там termination или Job Objects. Бинарные каналы остаются под
+проверкой `heavy-queue.test.js`. Тайминги этих дешёвых суррогатов не являются медиабенчмарком.
+Также используются `process-security.test.js`, `review-media-process.test.js`,
+`layer-render.test.js` (повторная проверка после ожидания, `--no-wait`, освобождение при ошибке,
+копирование видео и fallback), `remotion-ffmpeg-override.test.js` (изолированный limited-range
+override и команды mux/copy), `layer-import.test.js` и `review-media-import.test.js`
+(доверенная стратегия remux, fallback, быстрый proxy, сохранение HTTP encode и полного decode).
+`lesson-preview.test.js` проверяет занятую очередь, CLI-ошибку и освобождение слота preview
+после публикации/ошибки; `source-edit.test.js` – слот до project lease и освобождение
+при отказе encode для cuts/takes master. `media-finalization-security.test.js` проверяет
+`-vn` при замере громкости. Тесты этих изменений не заменяют проверки реального видео.
+
 Проверяются, среди прочего:
 
 - draft/approved-гейт и неизменность source/theme/aspect;
 - геометрия source/vertical/horizontal;
+- рабочий master: 4K → 1080p по короткой стороне, родной размер через `--quality source`,
+  поворот телефонного кадра, дубли и lanczos/setsar в одном проходе ffmpeg;
+- preview и гейт просмотра используют один масштаб с длинной стороной до 1920,
+  G6 отклоняет старый слой другого размера;
 - нормализация и валидация lesson brief;
 - глобальный таймкод видео между сценами;
 - музыкальный gain, fade, стартовый фрагмент и скорость;
@@ -179,7 +229,8 @@ SIGTERM, `/dev/fd`) пропускаются сами через `process.platfo
 PowerShell может скрыть код выхода нативной команды за пайпом. Браузерный `pult-ui.spec.js`
 в этот шаг не входит и остаётся в `review-ui`. Ещё один шаг запускает настоящие тесты склейки
 дублей (`tests/trim-media-real.test.js`, `tests/takes-master-media.test.js`,
-`tests/take-pauses.test.js`, `tests/project-takes.test.js`) после проверки кодера `libx264`.
+`tests/take-pauses.test.js`, `tests/project-takes.test.js`) и черновой нарезки
+(`tests/rough-cut-media.test.js`) после проверки кодера `libx264`.
 Локально проверяются команды и YAML; hosted Windows run остаётся обязательным pre-merge gate.
 
 Статический guard для `scripts/build.js` запрещает `execSync` и `shell: true`. Опции
@@ -198,6 +249,16 @@ Windows CI прогоняет их вместе с `tests/project-takes.test.js`
 FFmpeg нет `libx264`, чтобы тесты не пропустились молча. Контракт дублей закрывают
 `tests/takes-edit.test.js`, `tests/take-pauses.test.js`, `tests/takes-master.test.js`,
 `tests/project-takes.test.js` и `tests/takes-pack.test.js`; они входят в `npm run test:video-edit`.
+Черновую нарезку (`automontage roughcut`) закрывают два файла, тоже входящие в
+`npm run test:video-edit`. `tests/rough-cut.test.js` на фейках ffmpeg/ffprobe проверяет аргументы
+`encoder: 'proxy'`, граф склейки как у master, размер 720p (и у повёрнутой телефонной записи –
+портрет, а копия в чужом размере отвергается), слот очереди до блокировки проекта и его возврат при
+ошибке, отказы без записи в паспорт (имя, ревизия, уже готовая копия, FPS), абсолютный `--edit`,
+запись `roughCut` без новой ревизии, `confirm` (`ROUGH_CUT_MISSING`, `ROUGH_CUT_CHANGED` при
+подменённой копии, изменённом списке или чужом `expectedSha256`), разбор опций и склонение
+«месте/местах». `tests/rough-cut-media.test.js` на настоящем FFmpeg собирает копию из прямого и
+повёрнутого на 90° исходника 540×960: `h264`, `yuv420p`, 4 ± 0,08 с, тот же 540×960 без увеличения
+и атом `moov` перед `mdat`; Windows CI запускает его в шаге склейки дублей.
 `tests/take-pauses.test.js` закрывает уровни, порог паузы, выбор точки разреза, запрет перехода
 через другое слово, общие стыки и чтение звука на оси `trim` (в том числе MPEG-TS с поздним звуком);
 `tests/takes-master-media.test.js` проверяет на настоящем FFmpeg, что граница внутри звучания
@@ -206,6 +267,12 @@ FFmpeg нет `libx264`, чтобы тесты не пропустились м�
 кадров после склейки), а `tests/takes-master-media.test.js` проверяет дубль, у которого видео
 начинается позже звука, и дубль, взятый назад во времени; оба файла проверены на FFmpeg 6.1,
 7.1 и 9.0.
+`tests/project-clean.test.js` закрывает `automontage clean`: правила уровней `renders` и
+`archive`, сохранение финала, оригинала и активной ревизии, прокси b-roll и материалов текущего ТЗ,
+копий спикера без исходника рядом, ревизий legacy-проекта, текущего preview и видео карточек пульта;
+пропуск проектов, не готовых в пульте, свежих, заблокированных, нечитаемых и с нечитаемой папкой;
+симлинки при планировании и удалении, файлы, появившиеся после отчёта, ошибку удаления одного
+файла, отчёт без `--yes` и вызов через `automontage clean`.
 Chunk-render проверяет positive integer `totalFrames/--chunk`, рендерит part во временный
 соседний MP4 и публикует его rename только после успешного Remotion exit.
 Resume cache v2 адресуется SHA-256 от composition, канонизированных props, source/audio
@@ -412,14 +479,16 @@ node scripts/benchmark-preview.js \
 ## 7. CI
 
 `.github/workflows/ci.yml` сохраняет обычный Node 20 job с `npm ci`, `npm run check:privacy`,
-`npm test` и `npm run check:release` на pull request и push в `main`. Отдельный browser job выполняет
+установкой Playwright Chromium, `npm test` и `npm run check:release` на pull request и push в `main`.
+Chromium нужен тестам лид-магнитов, входящим в `npm test`. Отдельный browser job выполняет
 `npm ci --no-audit --no-fund`, устанавливает Playwright Chromium и запускает
 `npm run test:review-ui`. Оба Linux job явно устанавливают системный FFmpeg, проверяют
 `ffmpeg`, `ffprobe`, `libwebp`, `libx264`, `libvpx`, `libopus` и AAC до тестов: отсутствие
 реального media toolchain является ошибкой окружения, а не скрытым skip. Поэтому browser setup
 не может скрыть обычную Node-регрессию. Windows job ставит фиксированный FFmpeg 7.1.1 с
 обязательной проверкой checksum и запускает только переносимые probe/import/recovery/Save/
-approval/final-publication tests; полный POSIX-контракт остаётся в Linux `npm test`.
+approval/final-publication tests и сборку motion-слоя с границей `plan.js`; полный POSIX-контракт
+остаётся в Linux `npm test`.
 Release-checker проверяет committed current tree без base и работает с shallow checkout.
 Отдельный job устанавливает закреплённый Gitleaks CLI и сканирует полную Git-историю на секреты
 без отдельной лицензии GitHub App для организации.
@@ -571,9 +640,15 @@ node --test tests/broll-discovery.test.js tests/broll-review-security.test.js te
 node --test tests/broll-preview-approval.test.js
 node --test tests/broll-render-env-security.test.js tests/env.test.js
 npm run test:review-ui
+npx remotion browser ensure
 node --test --test-concurrency=1 tests/broll-preview-e2e.test.js tests/video-broll-e2e.test.js tests/custom-face-media-real.test.js
 node scripts/broll/live-acceptance.js
 ```
+
+`npx remotion browser ensure` заранее скачивает браузер Remotion. Без него на свежей установке
+первый настоящий preview качает браузер внутри ожидания теста, и скорость сети решает исход теста.
+`tests/broll-preview-e2e.test.js` ждёт само preview-задание, а не галочку в интерфейсе: сбой
+preview сразу роняет тест с кодом ошибки и хвостом вывода `preview.js`.
 
 Нужна полная сборка FFmpeg с WebP/H.264/VP8/Opus/AAC, а для нативного OCR - Tesseract с локальным
 `eng` language pack. На Ubuntu CI устанавливает `ffmpeg tesseract-ocr tesseract-ocr-eng`.
@@ -781,3 +856,176 @@ job). Прогон занимает до полуминуты.
 4. Через 30 минут без открытого окна процесс пульта завершается, `projects/.pult/instance.json`
    удалён.
 5. Человек без опыта без подсказок находит финал, оставляет правку и копирует фразу для агента.
+
+### Ручная проверка этапа черновой нарезки
+
+Автотесты (`tests/rough-cut*.test.js`, `tests/pult-*.test.js`, `tests/layer-*.test.js` и блок
+«Черновая нарезка до слоя» в браузерном `pult-ui.spec.js`) кнопку «Нарезка готова» нажимают сами. Перед выпуском
+этого этапа один раз проходят путь целиком на копии настоящего ролика, а кнопку нажимает человек:
+
+1. Стенд. В `tmp/accept-roughcut/projects/<папка>/` положить паспорт `project.json` ревизии 1 без
+   brief (через `createOrOpenProject` из `scripts/project/workspace.js`) и клонировать `cp -c` из
+   законченного ролика с исходником 1080p/50 или 4K: `input/source.mp4`, `transcript/words.json`,
+   а его `edit/v02-source.json` – как `edit/roughcut-v01.json`. `createOrOpenProject` копирует
+   исходник обычным способом, поэтому клон кладут поверх после создания паспорта. `tmp/`
+   игнорируется Git, настоящий `projects/` не трогать.
+2. `time node scripts/cli.js roughcut --project-dir tmp/accept-roughcut/projects/<папка> --edit
+   edit/roughcut-v01.json`: итог `✅ черновая нарезка…`, у ролика 100–120 с при свободной очереди
+   не дольше 40 с. `ffprobe previews/roughcut-v01.mp4`: `yuv420p`, 720 по короткой стороне, FPS и
+   длительность как у списка кусков; в `project.json.roughCut` `status: review`, `sha256` совпадает
+   с файлом.
+3. Пульт, проверяет человек: `node scripts/cli.js pult --projects-dir tmp/accept-roughcut/projects`.
+   Карточка «Черновая нарезка – посмотрите и отметьте оговорки»: видео играет, список вырезов
+   совпадает со списком кусков. Оставить правку на секунде, нажать «Нарезка готова». Агент и
+   автотест эту кнопку и `/api/*` не вызывают: утверждение – решение автора.
+4. `node scripts/cli.js inbox --projects-dir tmp/accept-roughcut/projects`: строка «Нарезка
+   подтверждена» и строка правки с двумя секундами – на копии и в исходнике. Вторую сверить с
+   списком: для секунды `t` внутри куска `i` она равна `keep[i].start` плюс `t` минус сумма
+   длин предыдущих кусков; на слух – `ffplay -ss <секунда> input/source.mp4`.
+5. `node scripts/cli.js layer new --project-dir tmp/accept-roughcut/projects/<папка>` до master
+   отказывает: «нарезка подтверждена, но master по ней ещё не собран…», папка `motion-vNN` не
+   создана.
+6. Правка автора вносится в копию списка: `edit/v02-source.json` из `edit/roughcut-v01.json`
+   (`roughcut-v01.json` не меняется), затем `time node scripts/cli.js master --project-dir
+   tmp/accept-roughcut/projects/<папка> --edit edit/v02-source.json` – ревизия исходника 2.
+7. `layer new` теперь создаёт `motion-v01`, во входящих нет строки «Нарезка подтверждена», а
+   `inbox --accept <папка> <id>` закрывает правку, и входящие по стенду пусты.
+
+Папку `tmp/accept-roughcut/` удаляют только после проверки и с согласия владельца.
+
+## 12. Лид-магниты: данные и проверка
+
+```bash
+node --test tests/lead-magnet-*.test.js
+npx playwright install chromium  # один раз, если локального браузера Playwright ещё нет
+node scripts/cli.js lead-magnet --help
+```
+
+Тесты используют временные проекты и проверяют обещания, решения, общую библиотеку,
+ревизии, бренд-пак, входящие, маршрут навыка и запрет команды утверждения в CLI.
+`lead-magnet-scaffold.test.js` проверяет заготовку, шрифты, логотип и UTM;
+`lead-magnet-scaffold-check.test.js` – запрет публикации незаполненных `data-lm-todo`;
+`lead-magnet-pdf.test.js` – локальную печать и защиту выходного пути;
+`lead-magnet-reference-tools.test.js` – импорт и снимки URL/HTML, запрет скриптов,
+нулевое число запросов к локальному HTTP-серверу из HTML-референса и блокировка
+подмены родительского каталога во время запуска браузера рядом с успешной съёмкой;
+`lead-magnet-skill.test.js` – наличие навыка в трёх местах и ключевые шаги маршрута.
+`lead-magnet-scaffold-check`, `lead-magnet-pdf` и `lead-magnet-reference-tools` запускают
+настоящий Chromium. `lead-magnet-check` тоже запускает
+настоящий Chromium: снимает страницу на 1280 и 390 px, проверяет ширину и обрезку текста,
+дословную цитату, обещанные единицы, блок CTA, кнопки копирования, логотип, внешние запросы,
+лимиты текстов и статусы фактов. Регрессии покрывают symlink в qa/page/facts/texts и подмену
+каталога во время запуска Chromium без записи наружу, устаревшие тексты/обещание/единицы при
+approval, перенос количества и типа из offer через CLI в новую проверку, красный отчёт при
+отсутствующих/повреждённых фактах и восстановление после исправления. Отсутствующий Chromium
+устанавливается командой выше. Тесты комментариев дополнительно проверяют откат PNG при
+ошибке записи JSON, очистку временной ссылки после сбоя отката и сохранение чужой замены
+даже при повторном использовании inode в Linux. Подмена каталога при очистке не должна
+удалять файл за пределами проекта и не должна возвращать успех для непригодного снимка.
+Сервер части 1B-1 проверяют `tests/lead-magnet-readiness.test.js` (единое правило
+готовности), `tests/pult-lead-magnet-view.test.js` (сводка и раздел карточки) и
+`tests/pult-lead-magnet-server.test.js` (маршруты, пропуски, изоляция страницы, референсы,
+правки и утверждение). Запуск вместе с прежними тестами:
+
+```bash
+npm test
+node scripts/check-public-privacy.js --tracked
+```
+
+Браузерные экраны части 1B-2 проверяет `tests/pult-lead-magnet-ui.spec.js` в составе
+`npm run test:review-ui`: плашка, окно параметров, вкладка, изолированная страница,
+правки, утверждение и изменившееся обещание. Подробный путь:
+[docs/LEAD-MAGNET.md](docs/LEAD-MAGNET.md).
+
+## 13. Motion-kit и гейты
+
+Как собирать слой и что значит каждый гейт – [docs/MOTION-KIT.md](docs/MOTION-KIT.md); почему
+гейты устроены так – D-034…D-040 в [DECISIONS.md](DECISIONS.md).
+
+```bash
+node --test tests/motion-kit-*.test.js tests/qa-*.test.js tests/layer-*.test.js
+node --test tests/lesson-preview.test.js tests/motion-workflow.test.js   # барьер внутри preview
+```
+
+Все эти файлы входят в обычный `npm test`. Тесты команд `layer` и гейтов по звуку и видео
+собирают маленькие проекты во временной папке и генерируют медиа через ffmpeg lavfi; без
+`ffmpeg` на `PATH` они пропускаются (в Linux CI он обязателен). Настоящие ролики, звуки
+библиотеки и ключи не читаются: библиотека звуков в тестах – пустая папка `no-library`,
+Pexels подменён. `tests/qa-preview.test.js` в той же маске – прежний QA preview, не motion-kit.
+
+Что проверяется:
+
+- kit (`motion-kit-*`): время и кадры, слова и написание, safe-зона, камера и пресеты, входы и
+  габариты элементов, вставки и возврат спикера, звуки и прореживание, субтитры, сборка
+  `compilePlan` и форма манифеста; React-компоненты – через рендер в разметку; alias
+  `@automontage/motion-kit` для Node и Remotion; `motion-kit-node.test.js` – сборка слоя esbuild,
+  понятные ошибки сломанного слоя и граница `plan.js` (в том числе пути Windows);
+  `motion-kit-docs.test.js` – что `docs/MOTION-KIT.md` называет G1–G12, все команды `layer` и
+  `@automontage/motion-kit/core` и не содержит личных путей и папок роликов, README показывает
+  `automontage layer new --project-dir`, а `.env.example` и `ASSETS.md` называют
+  `AUTOMONTAGE_SFX_DIR`;
+- гейты (`qa-*`): форма отчёта и коды выхода, G1–G5 и G9–G11 по манифесту, G6 и G7 по настоящему
+  звуку и видео, замер G8 в LU (логика G8 – на явном тестовом коридоре; отдельный тест закрепляет
+  откалиброванный коридор `avatar` 3/35/38/41/46 LU и то, что разрыв эталона 37,95 LU в нём
+  проходит; обе дорожки замера ровно длины preview и на ffmpeg 6.1 из apt в CI, где `-shortest`
+  обрезает сам файл микса на ~6 мс раньше; результат между версиями ffmpeg совпадает до сотых LU;
+  окна речи после конца голоса дают «голос не звучит», а не пропуск G8), G12 по доле контуров, барьер preview (строгий только для слоя из реестра, справочный
+  G8 для прочих, отчёт `qa/preview-*`, сбой записи);
+- команды (`layer-*`): `new`, `words`, `check`, `render` (с подменой Remotion), `import`, `brief`,
+  `stock`, `sheet`, очередь и `--no-wait` в `layer-render.test.js`, шаблон слоя
+  `layer-template.test.js` и маршрутизация CLI, строгие флаги и коды выхода `layer-cli.test.js`.
+
+Плохие случаи, которые обязаны остановить работу (`BAD CASE` в имени теста):
+
+- `qa-timeline-gates.test.js`: статичный план спикера 5 с; cover-вставка с 0 с прячет спикера,
+  даже пока камера ещё гаснет (G4); текст на x=40 и влёт элемента из-за края (G5, весь отрезок
+  нарушения); перелёт `pop` на пике, а не на первом кадре;
+- `qa-media-gates.test.js`: слой на 0,2 с длиннее исходника (G6, один кадр разницы проходит);
+  голос аватара в звуке слоя (G7, редкие эффекты проходят);
+- `qa-mix-gates.test.js`: музыка на уровне голоса останавливает preview, разрыв 12 LU проходит;
+- `layer-check.test.js`: один статичный план на весь слой (код 1) и сломанный план (код 2);
+  неверный `sfxMasterDb`; `plan.js`, импортирующий `node:fs`; исходник проекта сменился после
+  `layer new`;
+- `layer-render.test.js`: видео короче композиции при дополненном до полной длины звуке (G6);
+  слой длиннее исходника (G6); голос аватара в звуке слоя через настоящую цепочку рендера (G7);
+- `layer-template.test.js`: stock-вставка с `cover: false` не проходит мимо G4 – слой не собирается;
+- `layer-sheet.test.js`: кадр, который ffmpeg не отдал, останавливает команду честной ошибкой, а не
+  «ролик короче» (кадр без посчитанной доли контуров G12 считает пустым);
+- `layer-stock.test.js`: неизвестный `--insert`, неверные `--sec` и `--pick`, повторная загрузка
+  не перезаписывает файл, скачанное не mp4, небезопасный id или ссылка, пустой поиск,
+  `public/stock` – ссылка наружу, гонка файла с тем же id.
+
+Барьер preview без пометки `BAD CASE` проверяют `qa-preview-gates.test.js` (слой с музыкой на
+уровне голоса, проваленный или правленный руками отчёт рендера, слой для другого исходника,
+битый реестр, `qa/` как ссылка, один плохой слой из двух) и `lesson-preview.test.js` (стоп
+оставляет прошлый preview, незаписанный отчёт останавливает только preview слоя kit).
+`motion-workflow.test.js` закрепляет известный пробел: motion-reel барьер не вызывает.
+
+Настоящий Remotion-рендер kit и кадры шаблона – по флагу и **только из корня движка**
+(Remotion ищет скачанный браузер в `node_modules/.remotion` рядом с ближайшим `package.json` выше
+текущей папки; из другой папки он начинает скачивать Chrome):
+
+```bash
+AUTOMONTAGE_TEST_MOTION_RENDER=1 node --test tests/motion-kit-render.test.js tests/layer-render-still.test.js
+```
+
+`motion-kit-render.test.js` проверяет, что кегль субтитров одинаков на каждом кадре и текст не
+обрезается, а `FontLoader` рядом с субтитрами, а не вокруг слоя, роняет рендер.
+`layer-render-still.test.js` снимает кадры 15, 40, 90 и 160 шаблона и требует на них ожидаемые
+тексты kit внутри safe-зоны.
+Прогон занимает несколько минут и в CI не входит.
+
+В CI Windows-джоб выполняет отдельный шаг «Проверить сборку motion-слоя и границу plan.js»
+(`node --test tests/motion-kit-node.test.js`): пути и metafile esbuild на Windows другие.
+Первый настоящий прогон этого шага на Windows будет в CI после push или PR ветки.
+
+Ручная проверка слоя перед показом владельцу:
+
+1. `automontage layer check` и `automontage layer render` без ❌; предупреждения прочитаны.
+2. `automontage preview` опубликован, отчёт `qa/preview-*.txt` без стопа; с утверждённым рецептом
+   музыки аватар-роликов G8 около 38 LU (коридор 35–41 LU).
+3. `automontage layer sheet --project-dir projects/<ролик>`: на контакт-листе `qa/sheet-*.jpg`
+   текст внутри рамки safe-зоны, нет пустых кадров (G12), графика не выпала.
+4. Глазами в preview – кадры входов и выходов карточек и вставок, первые 3 с (спикер виден),
+   стыки вставок (спикер резкий до закрытия вставки), громкость эффектов и музыки под речью.
+5. После правок пульта – полоски `qa/sheet-<…>-comment-<id>.jpg` вокруг каждой правки.

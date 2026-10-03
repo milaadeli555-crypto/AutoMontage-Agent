@@ -10,6 +10,7 @@ const { displayDimensions, probeMediaPath, probeVideo } = require('../media-prob
 const { runTool } = require('../process');
 const { collectWords } = require('../tighten');
 const { runSegmentsTrim, runTrim } = require('../trim-media');
+const { parseQuality, workingSize, orientedSampleAspectRatio } = require('../working-quality');
 const {
   normalizeSourceMetadata,
   projectRelative,
@@ -18,9 +19,11 @@ const {
   roundedTime,
 } = require('./source-revision');
 const { buildTakesMaster } = require('./build-takes-master');
+const { assertRoughCutSettled } = require('./rough-cut-model');
 const { isTakesEdit } = require('./takes-edit');
 const { readTakeLevels } = require('./take-pauses');
 const { readProjectManifest, resolveProjectPath } = require('./workspace');
+const { acquireHeavySlotSync, heavyQueueConfig } = require('../heavy-queue');
 
 const validateSchema = new Ajv({ allErrors: true }).compile(sourceEditSchema);
 
@@ -65,7 +68,8 @@ function resolveRequestedEdit(workspace, requested, fileSystem) {
   });
 }
 
-function buildMaster({ projectDir, editPath }, dependencies = {}) {
+function buildMaster({ projectDir, editPath, quality = '1080p' }, dependencies = {}) {
+  quality = parseQuality(quality);
   const fileSystem = dependencies.fileSystem || fs;
   const runTrimImpl = dependencies.runTrimImpl || runTrim;
   const probeVideoImpl = dependencies.probeVideoImpl || probeVideo;
@@ -80,65 +84,78 @@ function buildMaster({ projectDir, editPath }, dependencies = {}) {
   const resolvedProjectDir = path.resolve(projectDir || '');
   if (!projectDir || !editPath) throw new Error('master requires --project-dir and --edit');
   const manifest = readProjectManifest(resolvedProjectDir);
+  // Пока черновая нарезка ждёт автора, master не собирается – ни слота очереди, ни файлов.
+  assertRoughCutSettled(manifest, 'master', { projectDir: resolvedProjectDir });
   const workspace = { dir: resolvedProjectDir, manifest };
   const editAbsolute = resolveRequestedEdit(workspace, editPath, fileSystem);
   const edit = JSON.parse(fileSystem.readFileSync(editAbsolute, 'utf8'));
   const editRelative = projectRelative(workspace.dir, editAbsolute);
   const source = normalizeSourceMetadata(manifest.source);
-  if (isTakesEdit(edit)) {
-    return buildTakesMaster({ workspace, edit, editRelative, source }, {
-      ...publishDependencies,
-      probeMediaPathImpl,
-      runSegmentsTrimImpl: dependencies.runSegmentsTrimImpl || runSegmentsTrim,
-      readTakeLevelsImpl: dependencies.readTakeLevelsImpl || readTakeLevels,
-    });
-  }
-  const sourcePath = resolveProjectPath(workspace.dir, source.localPath, {
-    label: 'active source path', fileSystem, mustExist: true, type: 'file',
+  const slot = (dependencies.acquireSlotSync || acquireHeavySlotSync)({
+    label: `master ${path.basename(resolvedProjectDir)}`, config: heavyQueueConfig(),
+    log: dependencies.log || console.log,
   });
-  const sourceProbe = probeVideoImpl(sourcePath, { stage: 'master source probe' });
-  const normalizedEdit = validateSourceEdit(edit, {
-    sourceRevision: source.revision,
-    sourceDuration: sourceProbe.duration,
-  });
-  if (Math.abs(sourceProbe.fps - normalizedEdit.fps) > 1e-6) {
-    throw new Error('source edit FPS does not match the active source');
-  }
-  const transcriptPath = resolveProjectPath(workspace.dir, manifest.transcript.words, {
-    label: 'active transcript path', fileSystem, mustExist: true, type: 'file',
-  });
-  const words = collectWords(JSON.parse(fileSystem.readFileSync(transcriptPath, 'utf8')));
-  const remapped = remapTranscriptWords(words, normalizedEdit.keep, normalizedEdit.fps);
-  const duration = normalizedEdit.keep.reduce((sum, range) => sum + range.end - range.start, 0);
-  // FFmpeg поворачивает кадр до фильтров, поэтому результат хранится в отображаемом размере.
-  const sourceMedia = probeMediaPathImpl(sourcePath, {
-    stage: 'master source media probe',
-    containerDurationFallback: true,
-  });
-  const result = publishSourceRevision({
-    workspace,
-    source,
-    editRelative,
-    words: remapped,
-    duration,
-    fps: normalizedEdit.fps,
-    expected: displayDimensions(sourceMedia),
-    encode(output) {
-      runTrimImpl({
-        input: sourcePath,
-        output,
-        intervals: normalizedEdit.keep.map(({ start, end }) => [start, end]),
-        audioFadeSec: 0.04,
-        precision: 6,
+  try {
+    if (isTakesEdit(edit)) {
+      return buildTakesMaster({ workspace, edit, editRelative, source, quality }, {
+        ...publishDependencies,
+        probeMediaPathImpl,
+        runSegmentsTrimImpl: dependencies.runSegmentsTrimImpl || runSegmentsTrim,
+        readTakeLevelsImpl: dependencies.readTakeLevelsImpl || readTakeLevels,
       });
-    },
-  }, publishDependencies);
-  return {
-    ...result,
-    kind: 'source',
-    duration: roundedTime(duration, normalizedEdit.fps),
-    removedDuration: roundedTime(sourceProbe.duration - duration, normalizedEdit.fps),
-  };
+    }
+    const sourcePath = resolveProjectPath(workspace.dir, source.localPath, {
+      label: 'active source path', fileSystem, mustExist: true, type: 'file',
+    });
+    const sourceProbe = probeVideoImpl(sourcePath, { stage: 'master source probe' });
+    const normalizedEdit = validateSourceEdit(edit, {
+      sourceRevision: source.revision,
+      sourceDuration: sourceProbe.duration,
+    });
+    if (Math.abs(sourceProbe.fps - normalizedEdit.fps) > 1e-6) {
+      throw new Error('source edit FPS does not match the active source');
+    }
+    const transcriptPath = resolveProjectPath(workspace.dir, manifest.transcript.words, {
+      label: 'active transcript path', fileSystem, mustExist: true, type: 'file',
+    });
+    const words = collectWords(JSON.parse(fileSystem.readFileSync(transcriptPath, 'utf8')));
+    const remapped = remapTranscriptWords(words, normalizedEdit.keep, normalizedEdit.fps);
+    const duration = normalizedEdit.keep.reduce((sum, range) => sum + range.end - range.start, 0);
+    // FFmpeg поворачивает кадр до фильтров, поэтому результат хранится в отображаемом размере.
+    const sourceMedia = probeMediaPathImpl(sourcePath, {
+      stage: 'master source media probe',
+      containerDurationFallback: true,
+    });
+    const target = workingSize({ ...displayDimensions(sourceMedia), sampleAspectRatio: orientedSampleAspectRatio(sourceMedia) }, quality);
+    const size = { width: target.width, height: target.height };
+    const result = publishSourceRevision({
+      workspace,
+      source,
+      editRelative,
+      words: remapped,
+      duration,
+      fps: normalizedEdit.fps,
+      expected: size,
+      encode(output) {
+        runTrimImpl({
+          input: sourcePath,
+          output,
+          intervals: normalizedEdit.keep.map(({ start, end }) => [start, end]),
+          scale: target.scaled ? { ...size, ...(quality === 'source' ? { sampleAspectRatio: orientedSampleAspectRatio(sourceMedia) } : {}) } : null,
+          audioFadeSec: 0.04,
+          precision: 6,
+        });
+      },
+    }, publishDependencies);
+    return {
+      ...result,
+      kind: 'source',
+      ...size,
+      quality,
+      duration: roundedTime(duration, normalizedEdit.fps),
+      removedDuration: roundedTime(sourceProbe.duration - duration, normalizedEdit.fps),
+    };
+  } finally { slot.release(); }
 }
 
 function takesSummaryLines(result) {
@@ -166,13 +183,14 @@ function takesSummaryLines(result) {
 }
 
 function parseMasterOptions(argv) {
-  const options = { projectDir: null, editPath: null };
+  const options = { projectDir: null, editPath: null, quality: '1080p' };
   for (let index = 0; index < argv.length; index += 2) {
     const key = argv[index];
     const value = argv[index + 1];
     if (!value || value.startsWith('--')) throw new Error(`${key} requires a value`);
     if (key === '--project-dir') options.projectDir = value;
     else if (key === '--edit') options.editPath = value;
+    else if (key === '--quality') options.quality = parseQuality(value);
     else throw new Error(`unknown master option: ${key}`);
   }
   if (!options.projectDir || !options.editPath) {
@@ -187,6 +205,7 @@ function main(argv = process.argv.slice(2)) {
     const result = buildMaster(parseMasterOptions(argv));
     console.log(`✅ source revision: ${result.revision}`);
     console.log(`   duration: ${result.duration.toFixed(2)} sec`);
+    console.log(`   size: ${result.width}×${result.height} (${result.quality})`);
     if (result.kind === 'takes') {
       for (const line of takesSummaryLines(result)) console.log(line);
     } else {

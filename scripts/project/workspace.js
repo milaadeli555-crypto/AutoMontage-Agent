@@ -22,6 +22,7 @@ const {
   preflightBriefBrollMedia,
   verifyBriefBrollMedia,
 } = require('../lesson/broll-media-files');
+const { roughCutPaths } = require('./rough-cut-model');
 const projectManifestValidator = new Ajv({ allErrors: true }).compile(projectSchema);
 const TEMPORARY_ID = /^[A-Za-z0-9_-]+$/;
 
@@ -126,7 +127,26 @@ function assertNoProjectSymlink(root, segments, fileSystem, label) {
   }
 }
 
+// Запись исчезла между проверкой и использованием: другой процесс как раз убрал файл.
+function isVanishedEntry(error) {
+  return Boolean(error && (error.code === 'ENOENT' || error.code === 'ENOTDIR'));
+}
+
+// Проверка пути читает файловую систему несколькими вызовами подряд. Если чужой процесс удалил
+// файл посреди проверки (например, отпустил lease), проверка повторяется целиком с нуля: каждый
+// повтор снова отказывает symlink и выходу за проект, а не пропускает шаг.
 function resolveProjectPath(projectDir, storedPath, options = {}) {
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return resolveProjectPathOnce(projectDir, storedPath, options);
+    } catch (error) {
+      if (attempt < 3 && isVanishedEntry(error)) continue;
+      throw error;
+    }
+  }
+}
+
+function resolveProjectPathOnce(projectDir, storedPath, options) {
   const label = options.label || 'project path';
   const fileSystem = options.fileSystem || fs;
   if (typeof storedPath !== 'string' || storedPath.length === 0 || storedPath.includes('\0')) {
@@ -227,6 +247,7 @@ function stageOwnedSiblingFile(destination, data, {
   writeToHandle = null,
   assertParentCurrent = null,
   verifyPublishedIdentity = false,
+  retainTemporaryLink = false,
 } = {}) {
   const bytes = writeToHandle
     ? null
@@ -305,14 +326,24 @@ function stageOwnedSiblingFile(destination, data, {
       }
       if (assertParentCurrent) assertParentCurrent();
       assertStageCurrent();
-      fileSystem.unlinkSync(temporaryPath);
+      if (!retainTemporaryLink) fileSystem.unlinkSync(temporaryPath);
     },
     commit(target = destination) {
       this.commitReplace(target);
     },
     cleanupTemp() {
+      if (retainTemporaryLink && assertParentCurrent) {
+        try { assertParentCurrent(); } catch { return false; }
+      }
       const current = lstatIfPresent(fileSystem, temporaryPath);
-      if (current && sameFileIdentity(identity, current)) fileSystem.unlinkSync(temporaryPath);
+      if (current && current.isFile() && !current.isSymbolicLink()
+        && sameFileIdentity(identity, current)) {
+        if (retainTemporaryLink && assertParentCurrent) {
+          try { assertParentCurrent(); } catch { return false; }
+        }
+        fileSystem.unlinkSync(temporaryPath);
+      }
+      return true;
     },
     removeCommitted() {
       if (!committedPath) return;
@@ -481,6 +512,24 @@ function validateProjectManifest(manifest, { projectDir, fileSystem = fs } = {})
   if (new Set(takeIds).size !== takeIds.length) {
     throw new Error('manifest.takes ids must be unique');
   }
+  const roughCut = migratedManifest.roughCut;
+  if (roughCut) {
+    if (roughCut.status === 'confirmed') {
+      if (!roughCut.confirmedAt) {
+        throw new Error('manifest.roughCut.confirmedAt is required when status is confirmed');
+      }
+      if (!roughCut.confirmedBy) {
+        throw new Error('manifest.roughCut.confirmedBy is required when status is confirmed');
+      }
+    } else if (roughCut.confirmedAt !== undefined || roughCut.confirmedBy !== undefined) {
+      const extra = roughCut.confirmedAt !== undefined ? 'confirmedAt' : 'confirmedBy';
+      throw new Error(`manifest.roughCut.${extra} is allowed only when status is confirmed`);
+    }
+    const pair = roughCutPaths(roughCut.editPath);
+    if (pair.filePath !== roughCut.filePath) {
+      throw new Error(`manifest.roughCut.filePath must be ${pair.filePath} for manifest.roughCut.editPath ${roughCut.editPath}`);
+    }
+  }
   if (!projectDir) return migratedManifest;
 
   const paths = [
@@ -496,6 +545,13 @@ function validateProjectManifest(manifest, { projectDir, fileSystem = fs } = {})
     paths.push(
       ['manifest.currentPreview.filePath', migratedManifest.currentPreview.filePath],
       ['manifest.currentPreview.briefPath', migratedManifest.currentPreview.briefPath],
+    );
+  }
+  if (roughCut) {
+    // Только containment: файла копии может ещё не быть (сборка идёт после записи паспорта).
+    paths.push(
+      ['manifest.roughCut.editPath', roughCut.editPath],
+      ['manifest.roughCut.filePath', roughCut.filePath],
     );
   }
   migratedManifest.briefs.forEach((brief, index) => {
@@ -968,12 +1024,22 @@ function acquireProjectMutationLease(projectDir, {
   platform = process.platform,
 } = {}) {
   const resolvedProjectDir = path.resolve(projectDir);
-  const leasePath = resolveProjectPath(resolvedProjectDir, PROJECT_MUTATION_LEASE, {
-    label: 'project mutation lease',
-    fileSystem,
-    mustExist: false,
-    type: 'file',
-  });
+  let leasePath;
+  try {
+    leasePath = resolveProjectPath(resolvedProjectDir, PROJECT_MUTATION_LEASE, {
+      label: 'project mutation lease',
+      fileSystem,
+      mustExist: false,
+      type: 'file',
+    });
+  } catch (error) {
+    // Lease другого процесса исчезает и появляется непрерывно: это занятость, а не сбой.
+    // Но если пропала сама папка проекта, это не «повторите позже»: отдаём исходную ошибку.
+    if (isVanishedEntry(error) && lstatIfPresent(fileSystem, resolvedProjectDir)?.isDirectory()) {
+      throw manifestConflict();
+    }
+    throw error;
+  }
   const token = safeTemporaryId(temporaryId);
   const owner = {
     version: 1,
@@ -1912,6 +1978,7 @@ function runRenderLifecycle(workspace, render, operation, {
 module.exports = {
   acquireProjectMutationLease,
   approveBrief,
+  captureProjectDirectoryGuard,
   copyProjectFileNoReplace,
   createOrOpenProject,
   formatProjectId,
@@ -1925,6 +1992,7 @@ module.exports = {
   resolveProjectPath,
   runRenderLifecycle,
   saveDraftRevision,
+  stageOwnedSiblingFile,
   slugifyProjectName,
   validateProjectManifest,
   withProjectMutation,

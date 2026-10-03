@@ -10,6 +10,13 @@ const MODERN_FILTER_SCRIPT_OPTION = '-/filter_complex';
 const LEGACY_FILTER_SCRIPT_OPTION = '-filter_complex_script';
 const FILTER_RATE = /^[1-9]\d{0,9}\/[1-9]\d{0,9}$/;
 const CHANNEL_LAYOUTS = new Set(['mono', 'stereo']);
+// master – рабочий исходник; proxy – лёгкая копия для просмотра (черновая нарезка):
+// быстрее кодируется, всегда yuv420p и с moov в начале файла, чтобы браузер играл сразу.
+const ENCODERS = Object.freeze({
+  master: Object.freeze(['-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-c:a', 'aac']),
+  proxy: Object.freeze(['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '26', '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart']),
+});
 
 function validateIntervals(intervals) {
   if (!Array.isArray(intervals) || intervals.length === 0) {
@@ -62,8 +69,15 @@ function buildSegmentsConcatFilter(segments, {
   precision = null,
   fps = null,
   audioFormat = null,
+  scale = null,
 } = {}) {
   const list = validateSegments(segments, inputCount);
+  if (scale !== null && ![scale.width, scale.height].every((side) => Number.isSafeInteger(side) && side > 0 && side % 2 === 0)) {
+    throw new Error('scale: размеры масштаба должны быть целыми чётными числами > 0');
+  }
+  if (scale?.sampleAspectRatio !== undefined && !/^[1-9]\d*:[1-9]\d*$/.test(scale.sampleAspectRatio)) {
+    throw new Error('scale: неверное соотношение пикселей');
+  }
   const fade = finiteNumber(audioFadeSec, 'audio fade', { min: 0, max: 1 });
   if (fps !== null && !FILTER_RATE.test(String(fps))) {
     throw new Error('FPS для склейки должен быть дробью вида 30000/1001');
@@ -102,17 +116,19 @@ function buildSegmentsConcatFilter(segments, {
     videoInputs += `[v${index}]`;
     audioInputs += `[a${index}]`;
   });
-  return `${filter}${videoInputs}concat=n=${list.length}:v=1:a=0[vout];${audioInputs}concat=n=${list.length}:v=0:a=1[aout]`;
+  const videoOutput = scale === null ? '[vout]' : `[vcat];[vcat]scale=${scale.width}:${scale.height}:flags=lanczos,setsar=${scale.sampleAspectRatio ? scale.sampleAspectRatio.replace(':', '/') : '1'}[vout]`;
+  return `${filter}${videoInputs}concat=n=${list.length}:v=1:a=0${videoOutput};${audioInputs}concat=n=${list.length}:v=0:a=1[aout]`;
 }
 
 function buildConcatFilter(intervals, {
   audioFadeSec = 0,
   precision = null,
+  scale = null,
 } = {}) {
   const keep = validateIntervals(intervals);
   return buildSegmentsConcatFilter(
     keep.map(([start, end]) => ({ input: 0, start, end })),
-    { inputCount: 1, audioFadeSec, precision },
+    { inputCount: 1, audioFadeSec, precision, scale },
   );
 }
 
@@ -138,6 +154,7 @@ function detectFilterScriptOption({ capture = captureTool } = {}) {
 
 function filterScriptCommand(inputs, output, filterPath, {
   filterScriptOption = MODERN_FILTER_SCRIPT_OPTION,
+  encoder = 'master',
 } = {}) {
   if (!Array.isArray(inputs) || inputs.length === 0) {
     throw new Error('нужен хотя бы один входной файл');
@@ -145,6 +162,7 @@ function filterScriptCommand(inputs, output, filterPath, {
   if (![MODERN_FILTER_SCRIPT_OPTION, LEGACY_FILTER_SCRIPT_OPTION].includes(filterScriptOption)) {
     throw new Error('неизвестная опция filter script для ffmpeg');
   }
+  if (!Object.hasOwn(ENCODERS, encoder)) throw new Error('неизвестный режим кодирования');
   return {
     command: 'ffmpeg',
     args: [
@@ -153,10 +171,7 @@ function filterScriptCommand(inputs, output, filterPath, {
       filterScriptOption, hostPath(filterPath),
       '-map', '[vout]',
       '-map', '[aout]',
-      '-c:v', 'libx264',
-      '-preset', 'veryfast',
-      '-crf', '20',
-      '-c:a', 'aac',
+      ...ENCODERS[encoder],
       hostPath(output),
     ],
   };
@@ -170,7 +185,7 @@ function defaultFilterPath() {
   return path.join(os.tmpdir(), `automontage-trim-${randomUUID()}.txt`);
 }
 
-function runFilterScript({ inputs, output, filter, filterPath, stage }, {
+function runFilterScript({ inputs, output, filter, filterPath, stage, encoder = 'master' }, {
   fileSystem = fs,
   run = runTool,
   filterScriptOption = null,
@@ -181,6 +196,7 @@ function runFilterScript({ inputs, output, filter, filterPath, stage }, {
     fileSystem.writeFileSync(resolvedFilterPath, filter);
     const command = filterScriptCommand(inputs, output, resolvedFilterPath, {
       filterScriptOption: filterScriptOption || detectOption(),
+      encoder,
     });
     run(command.command, command.args, { stage });
     return command;
@@ -193,13 +209,15 @@ function runTrim({
   input,
   output,
   intervals,
+  scale = null,
   audioFadeSec = 0,
   precision = null,
+  encoder = 'master',
   filterPath = defaultFilterPath(),
 }, dependencies = {}) {
-  const filter = buildConcatFilter(intervals, { audioFadeSec, precision });
+  const filter = buildConcatFilter(intervals, { audioFadeSec, precision, scale });
   return runFilterScript({
-    inputs: [input], output, filter, filterPath, stage: 'trim encode',
+    inputs: [input], output, filter, filterPath, stage: 'trim encode', encoder,
   }, dependencies);
 }
 
@@ -211,13 +229,14 @@ function runSegmentsTrim({
   precision = null,
   fps = null,
   audioFormat = null,
+  scale = null,
   filterPath = defaultFilterPath(),
 }, dependencies = {}) {
   if (!Array.isArray(inputs) || inputs.length === 0) {
     throw new Error('нужен хотя бы один входной файл');
   }
   const filter = buildSegmentsConcatFilter(segments, {
-    inputCount: inputs.length, audioFadeSec, precision, fps, audioFormat,
+    inputCount: inputs.length, audioFadeSec, precision, fps, audioFormat, scale,
   });
   return runFilterScript({
     inputs, output, filter, filterPath, stage: 'takes encode',

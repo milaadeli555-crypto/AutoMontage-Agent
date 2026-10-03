@@ -10,6 +10,7 @@ const {
   frameAnalysisCommand,
   paletteCommand,
   reframeCommand,
+  remotionLayerRenderCommand,
   remotionRenderCommand,
   videoProbeCommand,
 } = require('../scripts/build-commands');
@@ -32,6 +33,10 @@ function runBuildWithIntercept(t, args, {
     "const childProcess = require('node:child_process');",
     "const fs = require('node:fs');",
     "const path = require('node:path');",
+    // This fixture never starts a process: replace the lifetime boundary as well
+    // as spawnSync, so a fake successful launch cannot leave a pending ticket.
+    "const execution = require(path.join(process.cwd(), 'scripts/heavy-execution'));",
+    'execution.managedInvocation = (command, args, options) => ({ command, args, options });',
     "const calls = process.env.AUTOMONTAGE_BUILD_CAPTURE;",
     `const ffprobeRates = ${JSON.stringify(ffprobeRates)};`,
     `const materializeFinish = ${JSON.stringify(materializeFinish)};`,
@@ -158,6 +163,18 @@ test('Remotion preview options stay typed and become separate argv entries', () 
       props: `${HOSTILE}.json`,
       ...invalid,
     }), /scale|crf|frame|concurrency|overwrite/i);
+  }
+});
+
+test('remotionLayerRenderCommand validates concurrency the same way remotionRenderCommand does', () => {
+  const resolved = { command: process.execPath, argsPrefix: ['/repo/remotion-cli.js', '--env-file=/repo/config/remotion-public.env'] };
+  const base = { entry: 'motion-v01/src/index.jsx', composition: 'Layer', output: '/tmp/layer.mp4', publicDir: '/tmp/layer-public' };
+  const ok = remotionLayerRenderCommand(resolved, base);
+  assert.ok(ok.args.includes('--concurrency=50%'));
+  const custom = remotionLayerRenderCommand(resolved, { ...base, concurrency: 4 });
+  assert.ok(custom.args.includes('--concurrency=4'));
+  for (const concurrency of ['50%;touch sentinel', '0%', '101%', 0, -1, 257, 'abc', null]) {
+    assert.throws(() => remotionLayerRenderCommand(resolved, { ...base, concurrency }), /concurrency/i);
   }
 });
 
